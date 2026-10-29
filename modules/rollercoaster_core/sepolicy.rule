@@ -1,0 +1,5 @@
+# Minimal DMS HIDL lookup permissions used by the pinned AndroidOne Dolby policy.
+# The target vendor policy must already define hal_dms_hwservice; no broad permissive rule is added.
+allow hal_audio_default hal_dms_hwservice hwservice_manager find
+allow priv_app hal_dms_hwservice hwservice_manager find
+allow platform_app hal_dms_hwservice hwservice_manager find

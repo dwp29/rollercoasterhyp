@@ -1,0 +1,179 @@
+name: Build & Publish Rollercoaster Hypos 4.0.1.7 (joyeuse)
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_full_build:
+        description: "Build the complete ROM and save it as a workflow artifact"
+        type: boolean
+        required: true
+        default: true
+      publish_release:
+        description: "Upload the built ROM to GoFile and publish GitHub Release assets"
+        type: boolean
+        required: true
+        default: false
+      release_tag:
+        description: "GitHub Release tag"
+        type: string
+        required: false
+        default: "v4.0.1.7-joyeuse"
+  push:
+    branches:
+      - main
+      - "arena/**"
+    paths:
+      - "scripts/**"
+      - "config/**"
+      - "modules/**"
+      - ".github/workflows/build-rollercoaster-rom.yml"
+
+concurrency:
+  group: rollercoaster-rom-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Pre-flight verification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependency
+        run: python -m pip install --disable-pip-version-check Pillow
+
+      - name: Compile and run offline test suite
+        run: |
+          python -m py_compile scripts/*.py
+          python scripts/test_pipeline.py
+
+  build:
+    name: Build ROM image
+    if: github.event_name == 'workflow_dispatch' && inputs.run_full_build == true
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    permissions:
+      contents: read
+
+    steps:
+      - name: Free only known, unused runner packages
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost
+          df -h
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform and build tools
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+          python -m pip install --disable-pip-version-check Pillow
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            aria2 brotli zstd p7zip-full unzip zip curl jq git \
+            erofs-utils android-sdk-libsparse-utils e2fsprogs
+
+      - name: Run pre-flight verification
+        run: |
+          python -m py_compile scripts/*.py
+          python scripts/test_pipeline.py
+
+      - name: Build Rollercoaster Hypos 4.0.1.7
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python scripts/build_rom.py \
+            --config config/rollercoaster_joyeuse.json \
+            --work-dir "$RUNNER_TEMP/rom_work" \
+            --out-dir "$GITHUB_WORKSPACE/out" \
+            --sdk-root "$ANDROID_HOME"
+
+      - name: Save ROM build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollercoaster-hypos-4.0.1.7-joyeuse-build
+          path: |
+            out/Rollercoaster-Hypos-4.0.1.7-joyeuse-Roll3.3-Official.zip
+            out/build_manifest.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+  publish:
+    name: Upload GoFile and publish GitHub Release
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_release == true
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download the completed build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rollercoaster-hypos-4.0.1.7-joyeuse-build
+          path: out
+
+      - name: Upload full ZIP to GoFile and split GitHub assets below 1.9 GiB
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          TAG="${RELEASE_TAG:-v4.0.1.7-joyeuse}"
+          python scripts/upload_release.py \
+            --rom-zip out/Rollercoaster-Hypos-4.0.1.7-joyeuse-Roll3.3-Official.zip \
+            --manifest out/build_manifest.json \
+            --tag "$TAG" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --out-json out/release_summary.json \
+            --delete-source-after-gofile
+
+      - name: Upload release summary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollercoaster-hypos-4.0.1.7-release-summary
+          path: |
+            out/release_summary.json
+            out/build_manifest.json
+            out/gh_release_assets/SHA256SUMS.txt
+            out/gh_release_assets/RELEASE_NOTES.md
+          if-no-files-found: error
+          retention-days: 30
