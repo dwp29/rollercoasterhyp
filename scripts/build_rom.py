@@ -7,6 +7,7 @@ import argparse
 import base64
 import json
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -68,6 +69,77 @@ def safe_copy(src: Path, dst: Path) -> None:
             os.chmod(dst, dst.stat().st_mode | 0o200)
         except OSError:
             pass
+
+
+def safe_copy_android_path(
+    src: Path,
+    partition_root: Path,
+    relative_path: str,
+    partition_roots: Dict[str, Path],
+) -> Path:
+    """Copy through Android partition symlinks without following them on the runner host."""
+    relative = Path(relative_path)
+    if not relative.parts or relative.is_absolute() or any(part in ("", ".", "..") for part in relative.parts):
+        raise ValueError(f"Expected a clean relative Android path, got: {relative_path}")
+
+    roots = {
+        posixpath.normpath(mount): Path(os.path.abspath(root))
+        for mount, root in partition_roots.items()
+    }
+    root = Path(os.path.abspath(partition_root))
+    root_mount = next((mount for mount, mapped_root in roots.items() if mapped_root == root), None)
+    if root_mount is None:
+        raise ValueError(f"Partition root is not present in the Android root map: {partition_root}")
+
+    def map_android_target(target: str) -> Tuple[str, Tuple[str, ...]]:
+        normalized = posixpath.normpath(target)
+        for mount in sorted(roots, key=len, reverse=True):
+            prefix = mount.rstrip("/") or "/"
+            if normalized == prefix:
+                suffix = ""
+            elif prefix == "/" and normalized.startswith("/"):
+                suffix = normalized.lstrip("/")
+            elif normalized.startswith(prefix + "/"):
+                suffix = normalized[len(prefix) + 1 :]
+            else:
+                continue
+            return mount, tuple(Path(suffix).parts) if suffix else ()
+        raise RuntimeError(f"Android symlink points outside extracted partition roots: {target}")
+
+    current = root
+    logical_current = root_mount
+    pending = list(relative.parts[:-1])
+    visited_links: Set[Path] = set()
+    while pending:
+        component = pending.pop(0)
+        candidate = current / component
+        if candidate.is_symlink():
+            link_path = Path(os.path.abspath(candidate))
+            if link_path in visited_links:
+                raise RuntimeError(f"Cyclic Android partition symlink while staging {relative_path}: {candidate}")
+            visited_links.add(link_path)
+            link_target = os.readlink(candidate)
+            if os.path.isabs(link_target):
+                android_target = posixpath.normpath(link_target)
+            else:
+                android_target = posixpath.normpath(posixpath.join(logical_current, link_target))
+            mount, suffix = map_android_target(android_target)
+            current = roots[mount]
+            logical_current = mount
+            pending = list(suffix) + pending
+            continue
+
+        if candidate.exists():
+            if not candidate.is_dir():
+                raise RuntimeError(f"Android path ancestor is not a directory: {candidate}")
+        else:
+            candidate.mkdir()
+        current = candidate
+        logical_current = posixpath.join(logical_current, component)
+
+    destination = current / relative.parts[-1]
+    safe_copy(src, destination)
+    return destination
 
 
 def safe_write_text(dst: Path, content: str) -> None:
@@ -1671,8 +1743,16 @@ def main() -> None:
         [s_dir, p_dir, se_dir], cfg["debloat_dirs"], cfg["keep_packages_guard"]
     )
 
-    safe_copy(bootanim_zip, p_dir / "media" / "bootanimation.zip")
-    safe_copy(bootanim_zip, s_dir / "media" / "bootanimation.zip")
+    android_partition_roots = {
+        "/system": s_dir,
+        "/product": p_dir,
+        "/system_ext": se_dir,
+        "/vendor": v_dir,
+    }
+    for partition_name, partition_record in ws.partitions.items():
+        android_partition_roots.setdefault(f"/{partition_name}", partition_record.extract_dir)
+    safe_copy_android_path(bootanim_zip, p_dir, "media/bootanimation.zip", android_partition_roots)
+    safe_copy_android_path(bootanim_zip, s_dir, "media/bootanimation.zip", android_partition_roots)
     safe_copy(ios_mtz, s_dir / "rollercoaster" / "themes" / src_cfg["ios_theme_mtz_name"])
     safe_copy(ios_mtz, p_dir / "etc" / "precust_theme" / src_cfg["ios_theme_mtz_name"])
 

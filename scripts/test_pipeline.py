@@ -32,6 +32,7 @@ from build_rom import (
     patch_props_hook_instrumentation_text,
     patch_vendor_fstabs_strip_avb,
     safe_copy,
+    safe_copy_android_path,
     safe_remove,
     seed_ksu_and_modules,
     validate_dolby_selinux_policy,
@@ -346,6 +347,39 @@ class TestRollercoasterPipeline(unittest.TestCase):
             safe_remove(ro_pkg)
             self.assertFalse(ro_pkg.exists())
 
+            android_root = tdir / "android"
+            system_root = android_root / "system"
+            product_root = android_root / "product"
+            system_root.mkdir(parents=True)
+            product_root.mkdir(parents=True)
+            (system_root / "media").symlink_to("/product/media")
+            source = tdir / "bootanimation.zip"
+            source.write_bytes(b"bootanimation-fixture")
+            target = safe_copy_android_path(
+                source,
+                system_root,
+                "media/bootanimation.zip",
+                {"/system": system_root, "/product": product_root},
+            )
+            self.assertTrue((system_root / "media").is_symlink())
+            self.assertEqual(os.readlink(system_root / "media"), "/product/media")
+            self.assertEqual(target, product_root / "media" / "bootanimation.zip")
+            self.assertEqual(target.read_bytes(), b"bootanimation-fixture")
+
+            relative_root = tdir / "relative-android" / "extracted_parts"
+            relative_system = relative_root / "system" / "system"
+            relative_product = relative_root / "product" / "product"
+            relative_system.mkdir(parents=True)
+            relative_product.mkdir(parents=True)
+            (relative_system / "media").symlink_to("../product/media")
+            relative_target = safe_copy_android_path(
+                source,
+                relative_system,
+                "media/bootanimation.zip",
+                {"/system": relative_system, "/product": relative_product},
+            )
+            self.assertEqual(relative_target, relative_product / "media" / "bootanimation.zip")
+            self.assertEqual(relative_target.read_bytes(), b"bootanimation-fixture")
 
     def test_09_props_hook_smali_and_payload_validation(self) -> None:
         smali = """.method public newApplication(Ljava/lang/ClassLoader;Ljava/lang/String;Landroid/content/Context;)Landroid/app/Application;
