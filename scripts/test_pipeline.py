@@ -49,7 +49,7 @@ from rom_container import (
     detect_fs_type,
     erofs_uses_non_lz4_compression,
     escape_fc_regex,
-    parse_lpdump_geometry,
+    parse_super_geometry,
     sdat2img,
     sparse_img_to_sdat,
     sync_fs_config_and_contexts,
@@ -60,6 +60,59 @@ from upload_release import (
     render_release_notes,
     split_file_for_github,
 )
+
+
+def _write_test_super_image(path: Path, device_size: int = 0, virtual_ab: bool = False) -> None:
+    """Create an AOSP LP v1.2 image fixture with valid geometry/header/table checksums."""
+    metadata_max_size = 4096
+    metadata_slots = 2
+    device_size = device_size or (MAX_SUPER_DEVICE_SIZE_BYTES + 512 * 100)
+
+    geometry = bytearray(
+        struct.pack(
+            "<II32sIII",
+            0x616C4467,
+            52,
+            b"\0" * 32,
+            metadata_max_size,
+            metadata_slots,
+            4096,
+        )
+    )
+    geometry[8:40] = hashlib.sha256(geometry).digest()
+
+    partition = struct.pack("<36sIIII", b"system", 0, 0, 1, 1)
+    extent = struct.pack("<QIQI", 2048, 0, 100000, 0)
+    default_group = struct.pack("<36sIQ", b"default", 0, 0)
+    dynamic_group = struct.pack("<36sIQ", b"qti_dynamic_partitions", 0, device_size)
+    block_device = struct.pack("<QIIQ36sI", 100000, 1048576, 0, device_size, b"super", 0)
+    tables = partition + extent + default_group + dynamic_group + block_device
+
+    header_size = 256
+    header = bytearray(header_size)
+    struct.pack_into("<IHHI", header, 0, 0x414C5030, 10, 2, header_size)
+    struct.pack_into("<I", header, 44, len(tables))
+    header[48:80] = hashlib.sha256(tables).digest()
+    struct.pack_into("<III", header, 80, 0, 1, 52)
+    struct.pack_into("<III", header, 92, 52, 1, 24)
+    struct.pack_into("<III", header, 104, 76, 2, 48)
+    struct.pack_into("<III", header, 116, 172, 1, 64)
+    if virtual_ab:
+        struct.pack_into("<I", header, 128, 1)
+    normalized_header = bytearray(header)
+    normalized_header[12:44] = b"\0" * 32
+    header[12:44] = hashlib.sha256(normalized_header).digest()
+
+    raw_image = bytearray(32 * 4096)
+    raw_image[4096:4096 + len(geometry)] = geometry
+    raw_image[8192:8192 + len(geometry)] = geometry
+    primary_metadata = 4096 + 2 * 4096
+    backup_metadata = primary_metadata + metadata_max_size * metadata_slots
+    for metadata_offset in (primary_metadata, backup_metadata):
+        raw_image[metadata_offset:metadata_offset + header_size] = header
+        table_offset = metadata_offset + header_size
+        raw_image[table_offset:table_offset + len(tables)] = tables
+    path.write_bytes(raw_image)
 
 
 class TestRollercoasterPipeline(unittest.TestCase):
@@ -317,33 +370,25 @@ class TestRollercoasterPipeline(unittest.TestCase):
                 zf.writestr("classes.dex", b"PropsHookUtils setProps")
             validate_props_hook_zip(hook_zip)
 
-    def test_10_lpdump_geometry_is_capped_for_joyeuse(self) -> None:
+    def test_10_lp_metadata_geometry_is_capped_for_joyeuse(self) -> None:
         with tempfile.TemporaryDirectory() as td:
-            tdir = Path(td)
-            super_img = tdir / "super.img"
-            super_img.write_bytes(b"super")
-            lpdump = tdir / "lpdump"
-            lpdump.write_text(
-                "#!/bin/sh\ncat <<'EOF'\n"
-                "Metadata max size: 65536 bytes\n"
-                "Metadata slot count: 2\n"
-                "Partition table:\n"
-                "  Name: system\n"
-                "  Group: qti_dynamic_partitions\n"
-                "Group table:\n"
-                "  Name: qti_dynamic_partitions\n"
-                "  Maximum size: 99999999999 bytes\n"
-                "Block device table:\n"
-                "  Size: 99999999999 bytes\n"
-                "EOF\n",
-                encoding="utf-8",
-            )
-            lpdump.chmod(0o755)
-            geometry = parse_lpdump_geometry(super_img, lpdump)
+            super_img = Path(td) / "super.img"
+            _write_test_super_image(super_img)
+            geometry = parse_super_geometry(super_img)
             self.assertEqual(geometry.dev_size, MAX_SUPER_DEVICE_SIZE_BYTES)
-            self.assertLessEqual(geometry.groups["qti_dynamic_partitions"], MAX_SUPER_DEVICE_SIZE_BYTES - 4 * 1024 * 1024)
+            self.assertEqual(geometry.reported_dev_size, MAX_SUPER_DEVICE_SIZE_BYTES + 512 * 100)
+            self.assertLessEqual(
+                geometry.groups["qti_dynamic_partitions"],
+                MAX_SUPER_DEVICE_SIZE_BYTES - 4 * 1024 * 1024,
+            )
             self.assertFalse(geometry.is_ab)
+            self.assertEqual(geometry.metadata_size, 4096)
+            self.assertEqual(geometry.metadata_slots, 2)
             self.assertEqual(geometry.part_to_group["system"], "qti_dynamic_partitions")
+
+            virtual_ab_super = Path(td) / "super_virtual_ab.img"
+            _write_test_super_image(virtual_ab_super, virtual_ab=True)
+            self.assertTrue(parse_super_geometry(virtual_ab_super).is_ab)
 
     def test_11_split_camera_apk_and_device_integration(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -649,6 +694,56 @@ class TestRollercoasterPipeline(unittest.TestCase):
             self.assertTrue(any(item.get("href") == "media_codecs_dolby_audio.xml" for item in codec_config))
             merged = ET.parse(vendor / "etc" / "audio_effects.xml").getroot()
             self.assertTrue(any(item.get("name") == "spatializer" for item in merged.iter()))
+
+
+    def test_17_sparse_lp_metadata_checksums_and_backup_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            raw_super = root / "super.raw.img"
+            _write_test_super_image(raw_super)
+            raw_geometry = parse_super_geometry(raw_super)
+
+            raw_bytes = raw_super.read_bytes()
+            total_blocks = len(raw_bytes) // 4096
+            sparse_super = root / "super.sparse.img"
+            sparse_header = struct.pack(
+                "<IHHHHIIII",
+                SPARSE_MAGIC,
+                1,
+                0,
+                28,
+                12,
+                4096,
+                total_blocks,
+                2,
+                0,
+            )
+            dont_care_chunk = struct.pack("<HHII", 0xCAC3, 0, 1, 12)
+            raw_chunk_data = raw_bytes[4096:]
+            raw_chunk = struct.pack("<HHII", 0xCAC1, 0, total_blocks - 1, 12 + len(raw_chunk_data))
+            sparse_super.write_bytes(sparse_header + dont_care_chunk + raw_chunk + raw_chunk_data)
+            sparse_geometry = parse_super_geometry(sparse_super)
+            self.assertEqual(sparse_geometry.reported_dev_size, raw_geometry.reported_dev_size)
+            self.assertEqual(sparse_geometry.groups, raw_geometry.groups)
+            self.assertEqual(sparse_geometry.part_to_group, raw_geometry.part_to_group)
+
+            primary_metadata = 4096 + 2 * 4096
+            backup_metadata = primary_metadata + 4096 * 2
+            with raw_super.open("r+b") as image:
+                image.seek(primary_metadata + 256)
+                byte = image.read(1)
+                image.seek(primary_metadata + 256)
+                image.write(bytes([byte[0] ^ 1]))
+            # AOSP liblp semantics permit using the metadata backup when the primary copy is corrupt.
+            self.assertEqual(parse_super_geometry(raw_super).reported_dev_size, raw_geometry.reported_dev_size)
+
+            with raw_super.open("r+b") as image:
+                image.seek(backup_metadata + 256)
+                byte = image.read(1)
+                image.seek(backup_metadata + 256)
+                image.write(bytes([byte[0] ^ 1]))
+            with self.assertRaisesRegex(RuntimeError, "Invalid LP metadata"):
+                parse_super_geometry(raw_super)
 
 
 if __name__ == "__main__":

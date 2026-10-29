@@ -1347,10 +1347,10 @@ def prepare_port_tools(
         elif shutil.which(name):
             tools[name] = Path(shutil.which(name))
 
-    # lpmake/lpdump are intentionally taken from the configured OTA tools bundle,
-    # not silently mixed with versions bundled by the porting helper repository.
+    # lpmake is intentionally taken from the configured OTA tools bundle,
+    # not silently mixed with a tool bundled by the porting helper repository.
     if not otatools_url:
-        raise RuntimeError("Configured otatools ZIP is required for lpmake/lpdump")
+        raise RuntimeError("Configured otatools ZIP is required for lpmake")
     ota_dir = cache_dir / "otatools"
     ota_bin = ota_dir / "bin"
     ota_zip = download_file(
@@ -1358,18 +1358,30 @@ def prepare_port_tools(
         cache_dir / "otatools.zip",
         expected_sha256=otatools_sha256,
     )
-    if not ((ota_bin / "lpmake").is_file() and (ota_bin / "lpdump").is_file()):
+    if not all((ota_bin / name).is_file() for name in ("lpmake", "lpunpack")):
         ota_dir.mkdir(parents=True, exist_ok=True)
         run_cmd(["unzip", "-oq", str(ota_zip), "-d", str(ota_dir)])
-        for path in ota_bin.glob("*"):
-            if path.is_file():
-                path.chmod(path.stat().st_mode | 0o111)
-    for name in ("lpmake", "lpdump", "lpunpack"):
-        candidate = ota_bin / name
-        if candidate.is_file() and (name in ("lpmake", "lpdump") or (name == "lpunpack" and name not in tools)):
+    if not (ota_bin / "lpmake").is_file():
+        raise RuntimeError("Configured otatools ZIP does not contain bin/lpmake")
+
+    def find_ota_tool(name: str) -> Optional[Path]:
+        direct = ota_bin / name
+        if direct.is_file():
+            return direct
+        candidates = sorted(path for path in ota_dir.rglob(name) if path.is_file() and not path.is_symlink())
+        if not candidates:
+            return None
+        host_candidates = [
+            path for path in candidates
+            if any(part in ("linux-x86_64", "linux-x86") for part in path.parts)
+        ]
+        return (host_candidates or candidates)[0]
+
+    for name in ("lpmake", "lpunpack"):
+        candidate = find_ota_tool(name)
+        if candidate and (name == "lpmake" or name not in tools):
             candidate.chmod(candidate.stat().st_mode | 0o111)
             tools[name] = candidate
-
     ota_lib = ota_dir / "lib64"
     if ota_lib.is_dir():
         current_ld = os.environ.get("LD_LIBRARY_PATH", "")
@@ -1391,7 +1403,6 @@ def prepare_port_tools(
         "extract.erofs",
         "lpunpack",
         "lpmake",
-        "lpdump",
         "props_hook_zip",
         "apkeditor_jar",
         "baksmali_jar",
@@ -1572,7 +1583,7 @@ def main() -> None:
         raise RuntimeError(f"Base ROM is missing boot.img: {ws.boot_img_path}")
     if ws.container_type == "super":
         if ws.super_geom is None:
-            raise RuntimeError("lpdump did not produce super geometry; refusing to build an unchecked super image")
+            raise RuntimeError("LP metadata parser did not produce super geometry; refusing to build an unchecked super image")
         if ws.super_geom.is_ab:
             raise RuntimeError(
                 "The selected base ROM uses an A/B dynamic-partition layout. joyeuse is built as A-only; "
@@ -1759,6 +1770,10 @@ def main() -> None:
         "output_size_bytes": final_zip.stat().st_size,
         "output_sha256": sha256_file(final_zip),
         "container_type": ws.container_type,
+        "super_metadata_validation": {
+            "performed": ws.super_geom is not None,
+            "method": "AOSP liblp v10 parser; SHA-256 geometry/header/tables and bounds checks",
+        },
         "repacked_partitions": sorted(ws.partitions.keys()),
         "patched_vbmeta": patched_vbmeta,
         "patched_vendor_fstab_count": fstab_count,

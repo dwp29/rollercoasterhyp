@@ -19,6 +19,7 @@ Key guarantee for Rollercoaster-Roll.3.3 (`4.14.370`):
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -40,6 +41,7 @@ SUPER_METADATA_RESERVE_BYTES = 4 * 1024 * 1024
 @dataclass
 class SuperGeometry:
     dev_size: int = 9126805504  # Standard miatoll super partition size (8.5 GiB = 9,126,805,504 B)
+    reported_dev_size: int = 0
     metadata_size: int = 65536
     metadata_slots: int = 2
     is_ab: bool = False
@@ -268,79 +270,374 @@ def sparse_img_to_sdat(sparse_img: Path, out_prefix: Path) -> Tuple[Path, Path, 
     return transfer_list, new_dat, patch_dat
 
 
-def parse_lpdump_geometry(raw_super: Path, lpdump_bin: Optional[Path], tool_env: Optional[Dict[str, str]] = None) -> SuperGeometry:
-    geom = SuperGeometry(dev_size=min(raw_super.stat().st_size, MAX_SUPER_DEVICE_SIZE_BYTES))
-    max_group_budget = max(geom.dev_size - SUPER_METADATA_RESERVE_BYTES, 0)
-    geom.groups = {"qti_dynamic_partitions": max_group_budget}
+# AOSP system/core/fs_mgr/liblp metadata_format.h + reader.cpp layout (LP metadata v10).
+# Validate checksums and table bounds in-process instead of depending on a bundled lpdump binary.
+LP_METADATA_GEOMETRY_MAGIC = 0x616C4467
+LP_METADATA_HEADER_MAGIC = 0x414C5030
+LP_METADATA_GEOMETRY_SIZE = 4096
+LP_PARTITION_RESERVED_BYTES = 4096
+LP_SECTOR_SIZE = 512
+LP_METADATA_MAJOR_VERSION = 10
+LP_METADATA_MINOR_VERSION_MAX = 2
+LP_PARTITION_ATTR_SLOT_SUFFIXED = 1 << 1
+LP_GROUP_SLOT_SUFFIXED = 1 << 0
 
-    if not lpdump_bin:
-        return geom
-    if not lpdump_bin.is_file():
-        raise RuntimeError(f"Configured lpdump tool does not exist: {lpdump_bin}")
-    env = os.environ.copy()
-    if tool_env:
-        env.update(tool_env)
+
+class _SuperImageReader:
+    """Read raw or Android-sparse super images without expanding sparse files."""
+
+    _SPARSE_MAGIC = 0xED26FF3A
+    _CHUNK_RAW = 0xCAC1
+    _CHUNK_FILL = 0xCAC2
+    _CHUNK_DONT_CARE = 0xCAC3
+    _CHUNK_CRC32 = 0xCAC4
+
+    def __init__(self, path: Path):
+        if not path.is_file():
+            raise RuntimeError(f"Super image does not exist: {path}")
+        self.path = path
+        self._file = path.open("rb")
+        self.file_size = path.stat().st_size
+        self._chunks: List[Tuple[int, int, int, int]] = []
+        self._block_size = 0
+        self.logical_size = self.file_size
+        try:
+            magic = self._read_file(0, 4)
+            if len(magic) == 4 and struct.unpack("<I", magic)[0] == self._SPARSE_MAGIC:
+                self._read_sparse_index()
+        except Exception:
+            self._file.close()
+            raise
+
+    def close(self) -> None:
+        self._file.close()
+
+    def _read_file(self, offset: int, size: int) -> bytes:
+        if offset < 0 or size < 0 or offset + size > self.file_size:
+            raise RuntimeError(f"Read outside image bounds at {offset}+{size}")
+        self._file.seek(offset)
+        data = self._file.read(size)
+        if len(data) != size:
+            raise RuntimeError(f"Short read from super image at {offset}: {len(data)} of {size} bytes")
+        return data
+
+    def _read_sparse_index(self) -> None:
+        if self.file_size < 28:
+            raise RuntimeError("Truncated Android sparse image header")
+        header = self._read_file(0, 28)
+        magic, major, _minor, file_header_size, chunk_header_size, block_size, total_blocks, total_chunks, _checksum = struct.unpack(
+            "<IHHHHIIII", header
+        )
+        if magic != self._SPARSE_MAGIC or major != 1:
+            raise RuntimeError("Unsupported Android sparse image format")
+        if file_header_size < 28 or chunk_header_size < 12 or block_size < LP_SECTOR_SIZE or block_size % 4:
+            raise RuntimeError("Invalid Android sparse image header sizes")
+        if total_blocks <= 0 or total_chunks <= 0:
+            raise RuntimeError("Android sparse image has no data blocks")
+
+        self._block_size = block_size
+        self.logical_size = block_size * total_blocks
+        cursor = file_header_size
+        logical_offset = 0
+        for _ in range(total_chunks):
+            if cursor + chunk_header_size > self.file_size:
+                raise RuntimeError("Truncated Android sparse image chunk header")
+            chunk_header = self._read_file(cursor, chunk_header_size)
+            chunk_type, _reserved, chunk_blocks, total_size = struct.unpack_from("<HHII", chunk_header)
+            if total_size < chunk_header_size or cursor + total_size > self.file_size:
+                raise RuntimeError("Invalid Android sparse image chunk size")
+            data_offset = cursor + chunk_header_size
+            data_size = total_size - chunk_header_size
+            logical_length = chunk_blocks * block_size
+
+            if chunk_type == self._CHUNK_RAW:
+                if chunk_blocks == 0 or data_size != logical_length:
+                    raise RuntimeError("Invalid RAW chunk in Android sparse image")
+            elif chunk_type == self._CHUNK_FILL:
+                if chunk_blocks == 0 or data_size != 4:
+                    raise RuntimeError("Invalid FILL chunk in Android sparse image")
+            elif chunk_type == self._CHUNK_DONT_CARE:
+                if chunk_blocks == 0 or data_size != 0:
+                    raise RuntimeError("Invalid DONT_CARE chunk in Android sparse image")
+            elif chunk_type == self._CHUNK_CRC32:
+                if chunk_blocks != 0 or data_size != 4:
+                    raise RuntimeError("Invalid CRC32 chunk in Android sparse image")
+                logical_length = 0
+            else:
+                raise RuntimeError(f"Unknown Android sparse image chunk type: 0x{chunk_type:04x}")
+
+            if logical_length:
+                self._chunks.append((chunk_type, logical_offset, logical_length, data_offset))
+                logical_offset += logical_length
+            cursor += total_size
+
+        if logical_offset != self.logical_size:
+            raise RuntimeError(
+                "Android sparse image block count mismatch: "
+                f"chunks describe {logical_offset} bytes, header describes {self.logical_size}"
+            )
+
+    def read(self, offset: int, size: int) -> bytes:
+        if offset < 0 or size < 0 or offset + size > self.logical_size:
+            raise RuntimeError(f"Super metadata read outside logical image bounds at {offset}+{size}")
+        if size == 0:
+            return b""
+        if not self._chunks:
+            return self._read_file(offset, size)
+
+        result = bytearray(size)
+        end = offset + size
+        covered = 0
+        for chunk_type, chunk_start, chunk_size, data_offset in self._chunks:
+            chunk_end = chunk_start + chunk_size
+            overlap_start = max(offset, chunk_start)
+            overlap_end = min(end, chunk_end)
+            if overlap_start >= overlap_end:
+                continue
+            copy_size = overlap_end - overlap_start
+            result_offset = overlap_start - offset
+            chunk_offset = overlap_start - chunk_start
+            if chunk_type == self._CHUNK_RAW:
+                result[result_offset : result_offset + copy_size] = self._read_file(
+                    data_offset + chunk_offset, copy_size
+                )
+            elif chunk_type == self._CHUNK_FILL:
+                pattern = self._read_file(data_offset, 4)
+                pattern_offset = chunk_offset % 4
+                repeated = pattern * ((pattern_offset + copy_size + 3) // 4)
+                result[result_offset : result_offset + copy_size] = repeated[pattern_offset : pattern_offset + copy_size]
+            # DONT_CARE chunks represent zero-filled logical blocks.
+            covered += copy_size
+            if overlap_end == end:
+                break
+        if covered != size:
+            raise RuntimeError(f"Sparse super image has an uncovered metadata range at {offset}+{size}")
+        return bytes(result)
+
+
+def _decode_lp_name(raw: bytes, label: str) -> str:
+    name_bytes = raw.split(b"\0", 1)[0]
     try:
-        out = subprocess.check_output(
-            [str(lpdump_bin), str(raw_super)],
-            env=env,
-            text=True,
-            stderr=subprocess.STDOUT,
+        name = name_bytes.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(f"LP metadata contains a non-ASCII {label} name") from exc
+    if not name:
+        raise RuntimeError(f"LP metadata contains an empty {label} name")
+    return name
+
+
+def _read_lp_geometry(reader: _SuperImageReader) -> Tuple[int, int, int]:
+    errors: List[str] = []
+    for offset in (LP_PARTITION_RESERVED_BYTES, LP_PARTITION_RESERVED_BYTES + LP_METADATA_GEOMETRY_SIZE):
+        try:
+            raw = reader.read(offset, 52)
+            magic, struct_size = struct.unpack_from("<II", raw, 0)
+            if magic != LP_METADATA_GEOMETRY_MAGIC:
+                raise RuntimeError("invalid geometry magic")
+            if struct_size != 52:
+                raise RuntimeError(f"unsupported geometry structure size {struct_size}")
+            expected_checksum = raw[8:40]
+            normalized = bytearray(raw[:struct_size])
+            normalized[8:40] = b"\0" * 32
+            if hashlib.sha256(normalized).digest() != expected_checksum:
+                raise RuntimeError("geometry SHA-256 checksum mismatch")
+            metadata_size, metadata_slots, logical_block_size = struct.unpack_from("<III", raw, 40)
+            if metadata_size <= 0 or metadata_size % LP_SECTOR_SIZE:
+                raise RuntimeError("metadata maximum size is zero or not sector-aligned")
+            if metadata_slots <= 0:
+                raise RuntimeError("metadata slot count is zero")
+            if logical_block_size < LP_SECTOR_SIZE or logical_block_size % LP_SECTOR_SIZE:
+                raise RuntimeError("logical block size is invalid")
+            metadata_end = LP_PARTITION_RESERVED_BYTES + 2 * (
+                LP_METADATA_GEOMETRY_SIZE + metadata_size * metadata_slots
+            )
+            if metadata_end > reader.logical_size:
+                raise RuntimeError("metadata geometry exceeds the super image bounds")
+            return metadata_size, metadata_slots, logical_block_size
+        except RuntimeError as exc:
+            errors.append(f"offset {offset}: {exc}")
+    raise RuntimeError("Invalid LP geometry in primary and backup copies: " + "; ".join(errors))
+
+
+def _parse_lp_metadata_copy(
+    reader: _SuperImageReader,
+    metadata_size: int,
+    metadata_slots: int,
+    metadata_offset: int,
+) -> Tuple[int, int, Dict[str, int], Dict[str, str], bool]:
+    header_prefix = reader.read(metadata_offset, 128)
+    magic, major_version, minor_version, header_size = struct.unpack_from("<IHHI", header_prefix, 0)
+    if magic != LP_METADATA_HEADER_MAGIC:
+        raise RuntimeError("invalid metadata header magic")
+    if major_version != LP_METADATA_MAJOR_VERSION or minor_version > LP_METADATA_MINOR_VERSION_MAX:
+        raise RuntimeError(f"unsupported LP metadata version {major_version}.{minor_version}")
+    allowed_header_sizes = {128} if minor_version < 2 else {132, 256}
+    if header_size not in allowed_header_sizes:
+        raise RuntimeError(f"invalid metadata header size {header_size} for version 1.{minor_version}")
+    header = reader.read(metadata_offset, header_size)
+    expected_header_checksum = header[12:44]
+    normalized_header = bytearray(header)
+    normalized_header[12:44] = b"\0" * 32
+    if hashlib.sha256(normalized_header).digest() != expected_header_checksum:
+        raise RuntimeError("metadata header SHA-256 checksum mismatch")
+    header_flags = struct.unpack_from("<I", header, 128)[0] if header_size >= 132 else 0
+    has_slot_specific_layout = bool(header_flags & 0x1)  # LP_HEADER_FLAG_VIRTUAL_AB_DEVICE
+
+    tables_size = struct.unpack_from("<I", header, 44)[0]
+    expected_tables_checksum = header[48:80]
+    if tables_size <= 0 or header_size + tables_size > metadata_size:
+        raise RuntimeError("metadata tables exceed the configured metadata area")
+    tables = reader.read(metadata_offset + header_size, tables_size)
+    if hashlib.sha256(tables).digest() != expected_tables_checksum:
+        raise RuntimeError("metadata tables SHA-256 checksum mismatch")
+
+    table_specs = (
+        ("partitions", 80, 52),
+        ("extents", 92, 24),
+        ("groups", 104, 48),
+        ("block_devices", 116, 64),
+    )
+    descriptors: Dict[str, Tuple[int, int, int]] = {}
+    ranges: List[Tuple[int, int, str]] = []
+    for name, descriptor_offset, expected_entry_size in table_specs:
+        table_offset, count, entry_size = struct.unpack_from("<III", header, descriptor_offset)
+        if entry_size != expected_entry_size:
+            raise RuntimeError(f"invalid {name} entry size {entry_size}; expected {expected_entry_size}")
+        table_end = table_offset + count * entry_size
+        if table_offset > tables_size or table_end > tables_size:
+            raise RuntimeError(f"{name} table is outside the checksummed metadata area")
+        descriptors[name] = (table_offset, count, entry_size)
+        if count:
+            ranges.append((table_offset, table_end, name))
+    ranges.sort()
+    for previous, current in zip(ranges, ranges[1:]):
+        if current[0] < previous[1]:
+            raise RuntimeError(f"LP metadata tables overlap: {previous[2]} and {current[2]}")
+
+    _, partition_count, _ = descriptors["partitions"]
+    _, extent_count, _ = descriptors["extents"]
+    _, group_count, _ = descriptors["groups"]
+    _, block_device_count, _ = descriptors["block_devices"]
+    if partition_count == 0 or group_count == 0 or block_device_count == 0:
+        raise RuntimeError("LP metadata is missing partitions, groups, or block devices")
+
+    group_offset, _, _ = descriptors["groups"]
+    groups: List[Tuple[str, int, int]] = []
+    group_names: Set[str] = set()
+    for index in range(group_count):
+        entry = tables[group_offset + index * 48 : group_offset + (index + 1) * 48]
+        raw_name, flags, maximum_size = struct.unpack("<36sIQ", entry)
+        name = _decode_lp_name(raw_name, "group")
+        if flags & LP_GROUP_SLOT_SUFFIXED:
+            name += "_a"  # AOSP liblp reads metadata slot zero by default.
+            has_slot_specific_layout = True
+        if name in group_names:
+            raise RuntimeError(f"LP metadata contains duplicate group name: {name}")
+        group_names.add(name)
+        groups.append((name, flags, maximum_size))
+
+    extent_offset, _, _ = descriptors["extents"]
+    for index in range(extent_count):
+        entry = tables[extent_offset + index * 24 : extent_offset + (index + 1) * 24]
+        _num_sectors, target_type, _target_data, target_source = struct.unpack("<QIQI", entry)
+        if target_type not in (0, 1):
+            raise RuntimeError(f"LP metadata extent {index} has unknown target type {target_type}")
+        if target_type == 0 and target_source >= block_device_count:
+            raise RuntimeError(f"LP metadata extent {index} references an invalid block device")
+
+    partitions_offset, _, _ = descriptors["partitions"]
+    partition_to_group: Dict[str, str] = {}
+    partition_names: Set[str] = set()
+    valid_attributes = 0x03 | (0x0C if minor_version >= 1 else 0)
+    for index in range(partition_count):
+        entry = tables[partitions_offset + index * 52 : partitions_offset + (index + 1) * 52]
+        raw_name, attributes, first_extent, num_extents, group_index = struct.unpack("<36sIIII", entry)
+        name = _decode_lp_name(raw_name, "partition")
+        if attributes & ~valid_attributes:
+            raise RuntimeError(f"LP partition {name} has unsupported attributes")
+        if first_extent + num_extents > extent_count:
+            raise RuntimeError(f"LP partition {name} references an invalid extent range")
+        if group_index >= len(groups):
+            raise RuntimeError(f"LP partition {name} references an invalid group")
+        if attributes & LP_PARTITION_ATTR_SLOT_SUFFIXED:
+            name += "_a"  # Match AOSP metadata slot zero name adjustment.
+            has_slot_specific_layout = True
+        if name in partition_names:
+            raise RuntimeError(f"LP metadata contains duplicate partition name: {name}")
+        partition_names.add(name)
+        partition_to_group[name] = groups[group_index][0]
+
+    block_device_offset, _, _ = descriptors["block_devices"]
+    device_entry = tables[block_device_offset : block_device_offset + 64]
+    first_logical_sector, _alignment, _alignment_offset, device_size, _device_name, device_flags = struct.unpack(
+        "<QIIQ36sI", device_entry
+    )
+    if device_flags & 0x1:  # LP_BLOCK_DEVICE_SLOT_SUFFIXED
+        has_slot_specific_layout = True
+    if device_size <= 0 or device_size % LP_SECTOR_SIZE:
+        raise RuntimeError(f"LP metadata has an invalid super device size: {device_size}")
+    metadata_region_size = LP_PARTITION_RESERVED_BYTES + 2 * (
+        LP_METADATA_GEOMETRY_SIZE + metadata_size * metadata_slots
+    )
+    if first_logical_sector * LP_SECTOR_SIZE < metadata_region_size:
+        raise RuntimeError("LP metadata overlaps the logical partition data area")
+    if first_logical_sector * LP_SECTOR_SIZE > device_size:
+        raise RuntimeError("LP metadata places logical partitions beyond the super device size")
+
+    group_limits = {
+        name: maximum_size
+        for name, _flags, maximum_size in groups
+        if name != "default" and maximum_size > 0
+    }
+    return device_size, metadata_slots, group_limits, partition_to_group, has_slot_specific_layout
+
+
+def parse_super_geometry(super_image: Path) -> SuperGeometry:
+    """Validate AOSP LP metadata directly, including geometry/header/table SHA-256."""
+    reader = _SuperImageReader(super_image)
+    try:
+        metadata_size, metadata_slots, _logical_block_size = _read_lp_geometry(reader)
+        primary_offset = LP_PARTITION_RESERVED_BYTES + 2 * LP_METADATA_GEOMETRY_SIZE
+        backup_offset = primary_offset + metadata_size * metadata_slots
+        errors: List[str] = []
+        parsed: Optional[Tuple[int, int, Dict[str, int], Dict[str, str], bool]] = None
+        for offset in (primary_offset, backup_offset):
+            try:
+                parsed = _parse_lp_metadata_copy(reader, metadata_size, metadata_slots, offset)
+                break
+            except RuntimeError as exc:
+                errors.append(f"offset {offset}: {exc}")
+        if parsed is None:
+            raise RuntimeError("Invalid LP metadata in primary and backup copies: " + "; ".join(errors))
+
+        reported_size, parsed_slots, raw_groups, part_to_group, slot_specific_layout = parsed
+        if parsed_slots != metadata_slots:
+            raise RuntimeError("LP metadata slot count changed while reading geometry")
+        if reported_size > MAX_SUPER_DEVICE_SIZE_BYTES:
+            print(
+                f"[LP metadata] Clamping reported super size {reported_size} to the joyeuse maximum "
+                f"{MAX_SUPER_DEVICE_SIZE_BYTES} bytes"
+            )
+        device_size = min(reported_size, MAX_SUPER_DEVICE_SIZE_BYTES)
+        max_group_budget = max(device_size - SUPER_METADATA_RESERVE_BYTES, 0)
+        groups = {
+            name: min(group_size, max_group_budget)
+            for name, group_size in raw_groups.items()
+            if group_size > 0
+        }
+        if not groups:
+            groups = {"qti_dynamic_partitions": max_group_budget}
+        return SuperGeometry(
+            dev_size=device_size,
+            reported_dev_size=reported_size,
+            metadata_size=metadata_size,
+            metadata_slots=metadata_slots,
+            is_ab=metadata_slots >= 3 or slot_specific_layout,
+            groups=groups,
+            part_to_group=part_to_group,
         )
-    except (OSError, subprocess.CalledProcessError) as exc:
-        raise RuntimeError(f"lpdump could not inspect {raw_super}: {exc}") from exc
-
-    m_size = re.search(r"Size:\s*(\d+)\s*bytes", out)
-    if not m_size:
-        raise RuntimeError("lpdump output omitted the super device Size field")
-    reported_size = int(m_size.group(1))
-    if reported_size <= 0:
-        raise RuntimeError(f"lpdump reported an invalid super device size: {reported_size}")
-    if reported_size > MAX_SUPER_DEVICE_SIZE_BYTES:
-        print(
-            f"[lpdump] Clamping reported super size {reported_size} to the joyeuse maximum "
-            f"{MAX_SUPER_DEVICE_SIZE_BYTES} bytes"
-        )
-    geom.dev_size = min(reported_size, MAX_SUPER_DEVICE_SIZE_BYTES)
-    max_group_budget = max(geom.dev_size - SUPER_METADATA_RESERVE_BYTES, 0)
-
-    m_meta = re.search(r"Metadata max size:\s*(\d+)\s*bytes", out)
-    if not m_meta:
-        raise RuntimeError("lpdump output omitted Metadata max size")
-    geom.metadata_size = int(m_meta.group(1))
-    if geom.metadata_size <= 0:
-        raise RuntimeError(f"lpdump reported an invalid metadata size: {geom.metadata_size}")
-    m_slots = re.search(r"Metadata slot count:\s*(\d+)", out)
-    if not m_slots:
-        raise RuntimeError("lpdump output omitted Metadata slot count")
-    geom.metadata_slots = int(m_slots.group(1))
-    if geom.metadata_slots <= 0:
-        raise RuntimeError(f"lpdump reported an invalid metadata slot count: {geom.metadata_slots}")
-    geom.is_ab = geom.metadata_slots >= 3
-
-    groups: Dict[str, int] = {}
-    cur_g = None
-    for line in out.splitlines():
-        mg = re.search(r"^\s*Name:\s*(\S+)", line)
-        if mg:
-            cur_g = mg.group(1)
-        ms = re.search(r"^\s*Maximum size:\s*(\d+)\s*bytes", line)
-        if ms and cur_g and cur_g != "default":
-            group_size = int(ms.group(1))
-            if group_size > 0:
-                groups[cur_g] = min(group_size, max_group_budget)
-    if groups:
-        geom.groups = groups
-
-    cur_p = None
-    for line in out.splitlines():
-        mp = re.search(r"^\s*Name:\s*([a-zA-Z0-9_]+)$", line)
-        if mp:
-            cur_p = mp.group(1)
-        mpg = re.search(r"^\s*Group:\s*(\S+)", line)
-        if mpg and cur_p:
-            geom.part_to_group[cur_p] = mpg.group(1)
-    return geom
+    finally:
+        reader.close()
 
 
 def escape_fc_regex(path_str: str) -> str:
@@ -654,7 +951,7 @@ def unpack_rom_zip(
             else:
                 shutil.move(str(super_img), str(raw_super))
 
-        super_geom = parse_lpdump_geometry(raw_super, tools.get("lpdump"), tools.get("_env"))  # type: ignore[arg-type]
+        super_geom = parse_super_geometry(raw_super)
         super_geom.was_sparse = bool(geom_flags["was_sparse"])
         super_geom.was_zstd = bool(geom_flags["was_zstd"])
         super_geom.was_brotli_dat = bool(geom_flags["was_brotli_dat"])
@@ -865,36 +1162,24 @@ def repack_rom_workspace(
 
         lp_cmd.extend(["--output", str(raw_or_sparse_super)])
         run_cmd(lp_cmd, env_extra=tools.get("_env"))  # type: ignore[arg-type]
-        lpdump_bin = tools.get("lpdump")
-        if not lpdump_bin or not Path(lpdump_bin).is_file():
-            raise RuntimeError("otatools lpdump is required to verify the rebuilt super image")
-        verify_env = os.environ.copy()
-        if tools.get("_env"):
-            verify_env.update(tools["_env"])
-        verify_output = subprocess.check_output(
-            [str(lpdump_bin), str(raw_or_sparse_super)],
-            env=verify_env,
-            text=True,
-            stderr=subprocess.STDOUT,
-        )
-        output_size_match = re.search(r"Size:\s*(\d+)\s*bytes", verify_output)
-        if not output_size_match:
-            raise RuntimeError("lpdump could not report the rebuilt super device size")
-        output_device_size = int(output_size_match.group(1))
+        verified_geom = parse_super_geometry(raw_or_sparse_super)
+        output_device_size = verified_geom.reported_dev_size
         if output_device_size <= 0:
-            raise RuntimeError(f"lpdump reported an invalid rebuilt super size: {output_device_size}")
+            raise RuntimeError(f"LP metadata reported an invalid rebuilt super size: {output_device_size}")
         if output_device_size > MAX_SUPER_DEVICE_SIZE_BYTES or output_device_size > geom.dev_size:
             raise RuntimeError(
                 "lpmake output exceeds the configured joyeuse super capacity: "
                 f"{output_device_size} > min({MAX_SUPER_DEVICE_SIZE_BYTES}, {geom.dev_size}) bytes"
             )
-        output_slots_match = re.search(r"Metadata slot count:\s*(\d+)", verify_output)
-        if not output_slots_match:
-            raise RuntimeError("lpdump could not report metadata slots for the rebuilt super image")
-        output_slots = int(output_slots_match.group(1))
-        if output_slots != geom.metadata_slots:
+        if verified_geom.metadata_size != geom.metadata_size:
             raise RuntimeError(
-                f"Rebuilt super metadata-slot count changed unexpectedly: {output_slots} != {geom.metadata_slots}"
+                "Rebuilt super metadata size changed unexpectedly: "
+                f"{verified_geom.metadata_size} != {geom.metadata_size}"
+            )
+        if verified_geom.metadata_slots != geom.metadata_slots:
+            raise RuntimeError(
+                "Rebuilt super metadata-slot count changed unexpectedly: "
+                f"{verified_geom.metadata_slots} != {geom.metadata_slots}"
             )
 
         for p in rebuilt_imgs.values():

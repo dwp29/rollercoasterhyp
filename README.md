@@ -9,7 +9,7 @@ Proyek ini menyiapkan ROM untuk **Xiaomi Redmi Note 9 Pro (`joyeuse`, keluarga `
 ## Integrasi yang disiapkan
 
 - Mengganti kernel di `boot.img` menggunakan `magiskboot`, memeriksa checksum kernel, batas ukuran partisi boot 128 MiB, dan hasil round-trip. Metadata `vbmeta` yang ditemukan dipatch untuk menonaktifkan verifikasi/hash-tree.
-- Mengemas ulang partisi EROFS dengan LZ4HC (`mkfs.erofs -zlz4hc,9`) agar sesuai dengan kernel yang dipilih. Ukuran `super.img` dan grup partisi dibatasi sesuai kapasitas joyeuse; pipeline menolak layout A/B.
+- Mengemas ulang partisi EROFS dengan LZ4HC (`mkfs.erofs -zlz4hc,9`) agar sesuai dengan kernel yang dipilih. Metadata `super.img` divalidasi langsung mengikuti format AOSP liblp v10—termasuk checksum SHA-256 geometri, header, tabel, batas tabel, kapasitas perangkat, dan slot—untuk input raw/sparse serta hasil rebuild. Ini tidak mematikan pemeriksaan dan menghindari ketergantungan pada biner `lpdump` pihak ketiga. Ukuran `super.img` dan grup partisi dibatasi sesuai kapasitas joyeuse; pipeline menolak layout A/B.
 - Mengintegrasikan PropsHook ke `framework.jar` dengan hook pada `Instrumentation`, tanpa menerapkan patch signature-bypass dari proyek port sumber.
 - Menyiapkan modul KernelSU melalui `ksud`. Modul yang sudah ada dengan ID sama tidak ditimpa. Pengaktifan modul dan layanan root tetap perlu dicek pada perangkat.
 - Menambal properti dan file fitur khusus `joyeuse`, GPS Indonesia, serta daftar aplikasi CN. Perubahan flag fitur tidak membuktikan bahwa NFC, face unlock, VoLTE/VoWiFi, atau fungsi hardware lain bekerja.
