@@ -16,6 +16,14 @@ Proyek ini menyiapkan ROM untuk **Xiaomi Redmi Note 9 Pro (`joyeuse`, keluarga `
 - Menggabungkan audio effects/codec Dolby dan spatializer dari sumber yang dipin, membangun DAX UI Bahasa Indonesia, serta menyusun APK Leica Camera v6.8 dari potongan sumber. Policy HIDL DMS yang sempit ditambahkan lewat KernelSU sebelum kelas HAL dimulai; layanan DMS tetap dinonaktifkan jika policy atau label runtime tidak tervalidasi. Tidak ada domain SELinux yang dibuat permissive. Integrasi file tidak menjamin HAL, izin, codec, kamera, atau efek audio berfungsi di perangkat.
 - Menyertakan Rollercoaster Support/overlay, tema MTZ, bootanimation, KernelSU Manager/WebUI, AdAway, HeliBoard, Insular, serta modul ReVanced yang diperiksa terhadap checksum dan payload MicroG.
 
+## Mengumpulkan log setelah bootloop
+
+ZIP recovery `recovery/Rollercoaster-Bootloop-Logger-1.0-joyeuse.zip` mengumpulkan pstore/ramoops dan `/proc/last_kmsg` jika tersedia, tombstone/ANR/DropBox yang dapat dibaca dari `/data`, serta log dan konteks recovery. ZIP ini hanya menulis folder hasil log; tidak mem-flash atau mengubah partisi ROM.
+
+Cara pakai: boot ke TWRP/OrangeFox setelah bootloop, jangan wipe sebelum mengumpulkan log, lalu flash ZIP tersebut. Jika recovery meminta dekripsi `/data`, buka kunci dahulu agar log aplikasi dapat dibaca. Hasil biasanya berada di `BootloopLogs/bootloop-...`; salin melalui MTP atau `adb pull`. Jika hasil sementara ditulis ke `/tmp/BootloopLogs`, ambil dengan ADB sebelum keluar dari recovery.
+
+**Batasan:** Android logcat biasa dan dmesg yang hanya berada di RAM hilang saat reboot. Log dari boot gagal hanya dapat diambil bila kernel/perangkat menyimpannya ke pstore/ramoops atau menyediakan `/proc/last_kmsg`. Log dapat berisi informasi privat; tinjau sebelum dibagikan. ZIP belum diuji pada recovery fisik joyeuse dan harus digunakan melalui TWRP/OrangeFox, bukan fastboot.
+
 ## Verifikasi dan build
 
 Push perubahan hanya menjalankan pemeriksaan sintaks dan rangkaian tes offline. Sebelum build penuh, jalankan inspeksi sumber melalui GitHub Actions (`workflow_dispatch`) dengan `run_full_build=false` dan `publish_release=false`; artifact `source-fstab-inspection` memuat fstab ramdisk/DTB ROM sumber tanpa repack atau publikasi. Build ROM lengkap tetap manual, dan `publish_release` hanya boleh diaktifkan setelah build serta pemeriksaan hasil dinilai aman.

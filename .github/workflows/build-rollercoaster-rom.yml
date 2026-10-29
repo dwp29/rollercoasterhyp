@@ -56,6 +56,7 @@ jobs:
         run: |
           python -m py_compile scripts/*.py
           python scripts/test_pipeline.py
+          python scripts/test_bootloop_logger.py
 
   inspect-source-fstabs:
     name: Inspect source boot fstabs (diagnostic only)
@@ -137,6 +138,7 @@ jobs:
         run: |
           python -m py_compile scripts/*.py
           python scripts/test_pipeline.py
+          python scripts/test_bootloop_logger.py
 
       - name: Build Rollercoaster Hypos 4.0.1.7
         env:

@@ -18,3 +18,4 @@ rom_work/
 *.mtz
 *.zip
 !prebuilt/kernel/*.zip
+!recovery/Rollercoaster-Bootloop-Logger-1.0-joyeuse.zip

@@ -1,0 +1,49 @@
+#!/sbin/sh
+# Recovery-flashable, read-only bootloop diagnostic collector.
+
+OUTFD="$2"
+ZIPFILE="$3"
+TMPDIR="/tmp/rollercoaster-bootloop-logger.$$"
+
+ui_print() {
+    message="$1"
+    case "$OUTFD" in
+        ''|*[!0-9]*) printf '%s\n' "$message"; return ;;
+    esac
+    if [ -e "/proc/self/fd/$OUTFD" ] && printf 'ui_print %s\nui_print\n' "$message" > "/proc/self/fd/$OUTFD" 2>/dev/null; then
+        return
+    fi
+    printf '%s\n' "$message"
+}
+
+fail() {
+    ui_print "ERROR: $1"
+    rm -rf "$TMPDIR" 2>/dev/null
+    exit 1
+}
+
+[ -n "$ZIPFILE" ] && [ -f "$ZIPFILE" ] || fail "Recovery did not provide the installer ZIP path."
+mkdir -p "$TMPDIR" || fail "Could not create a temporary directory in recovery."
+
+extract_collector() {
+    if command -v unzip >/dev/null 2>&1; then
+        unzip -p "$ZIPFILE" bootloop-logger/collect.sh > "$TMPDIR/collect.sh"
+    elif command -v toybox >/dev/null 2>&1; then
+        toybox unzip -p "$ZIPFILE" bootloop-logger/collect.sh > "$TMPDIR/collect.sh"
+    elif command -v busybox >/dev/null 2>&1; then
+        busybox unzip -p "$ZIPFILE" bootloop-logger/collect.sh > "$TMPDIR/collect.sh"
+    else
+        return 1
+    fi
+}
+
+extract_collector || fail "No compatible unzip command was found in this recovery."
+[ -s "$TMPDIR/collect.sh" ] || fail "The log-collector script is missing from this ZIP."
+chmod 0700 "$TMPDIR/collect.sh" 2>/dev/null
+
+ui_print "Rollercoaster Bootloop Log Collector 1.0"
+ui_print "Collecting available persistent and recovery logs; no ROM partitions will be flashed."
+sh "$TMPDIR/collect.sh" "$OUTFD"
+STATUS=$?
+rm -rf "$TMPDIR" 2>/dev/null
+exit "$STATUS"
