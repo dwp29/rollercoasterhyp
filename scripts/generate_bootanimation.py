@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Procedural 1080x2400 @ 60fps Bootanimation Generator for Rolleracoaster Hypos 4.0.1.7.
+"""Procedural 1080x2400 @ 60fps Bootanimation Generator for Rollercoaster Hypos 4.0.1.7.
 
 Renders 'Rollercoaster' letters falling from above with bounce physics, merging together
 with 'OS', and shimmering in full-spectrum RGB neon glow + sparkles.

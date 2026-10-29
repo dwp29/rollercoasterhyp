@@ -24,12 +24,9 @@ echo 0 > /proc/sys/vm/page-cluster 2>/dev/null
 echo 20 > /proc/sys/vm/dirty_ratio 2>/dev/null
 echo 10 > /proc/sys/vm/dirty_background_ratio 2>/dev/null
 
-# 2. Ensure Google Play Basic Services ON, Bypass 10s Intercept Warning & Real-Time Push Notification whitelist
+# 2. Keep Google Play services and real-time notification settings available.
+# Installer verification and confirmation prompts are intentionally left unchanged.
 settings put system google_core_control 1 2>/dev/null
-settings put global verifier_verify_adb_installs 0 2>/dev/null
-settings put secure install_non_market_apps 1 2>/dev/null
-settings put secure adb_install_need_confirm 0 2>/dev/null
-settings put secure permcenter_install_intercept_enabled 0 2>/dev/null
 settings put system status_bar_show_notification_icon 1 2>/dev/null
 
 for ovl in \

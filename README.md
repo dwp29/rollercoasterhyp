@@ -1,38 +1,41 @@
-# 🎢 Rolleracoaster Hypos 4.0.1.7 — Automated Custom ROM Builder (`joyeuse`)
+# 🎢 Rollercoaster Hypos 4.0.1.7 — ROM builder (`joyeuse`)
 
-Pipeline otomatis berbasis GitHub Actions untuk membangun, mengoptimalkan, dan mempublikasikan ROM **Rolleracoaster Hypos 4.0.1.7** (berbasis **HyperOS 4.0.17.0 / Android 17**) secara khusus untuk **Xiaomi Redmi Note 9 Pro (`joyeuse` / `miatoll`)**.
+Proyek ini menyiapkan ROM untuk **Xiaomi Redmi Note 9 Pro (`joyeuse`, keluarga `miatoll`)**, dengan target basis Xiaomi HyperOS `4.0.17.0` / Android 17. Nilai tersebut adalah target yang ditulis di konfigurasi; kompatibilitas akhir tetap harus dipastikan terhadap arsip ROM sumber dan perangkat nyata.
 
-- **Nama Versi ROM:** `Rolleracoaster Hypos 4.0.1.7`
-- **Perangkat Target:** Redmi Note 9 Pro (`joyeuse`)
-- **Pembuat / Maintainer:** **Graziemille**
-- **Dukungan Telegram:** [**@Grazie_milles**](https://t.me/Grazie_milles)
+- **Maintainer:** Graziemille — [@Grazie_milles](https://t.me/Grazie_milles)
+- **Konfigurasi:** `config/rollercoaster_joyeuse.json`
+- **Kernel:** `prebuilt/kernel/Rollercoaster-Roll.3.3.zip`
 
----
+## Integrasi yang disiapkan
 
-## ✨ Arsitektur & Fitur Utama
+- Mengganti kernel di `boot.img` menggunakan `magiskboot`, memeriksa checksum kernel, batas ukuran partisi boot 128 MiB, dan hasil round-trip. Metadata `vbmeta` yang ditemukan dipatch untuk menonaktifkan verifikasi/hash-tree.
+- Mengemas ulang partisi EROFS dengan LZ4HC (`mkfs.erofs -zlz4hc,9`) agar sesuai dengan kernel yang dipilih. Ukuran `super.img` dan grup partisi dibatasi sesuai kapasitas joyeuse; pipeline menolak layout A/B.
+- Mengintegrasikan PropsHook ke `framework.jar` dengan hook pada `Instrumentation`, tanpa menerapkan patch signature-bypass dari proyek port sumber.
+- Menyiapkan modul KernelSU melalui `ksud`. Modul yang sudah ada dengan ID sama tidak ditimpa. Pengaktifan modul dan layanan root tetap perlu dicek pada perangkat.
+- Menambal properti dan file fitur khusus `joyeuse`, GPS Indonesia, serta daftar aplikasi CN. Perubahan flag fitur tidak membuktikan bahwa NFC, face unlock, VoLTE/VoWiFi, atau fungsi hardware lain bekerja.
+- Menggabungkan audio effects/codec Dolby dan spatializer dari sumber yang dipin, membangun DAX UI Bahasa Indonesia, serta menyusun APK Leica Camera v6.8 dari potongan sumber. Integrasi file tidak menjamin HAL, izin, codec, kamera, atau efek audio berfungsi di perangkat.
+- Menyertakan Rollercoaster Support/overlay, tema MTZ, bootanimation, KernelSU Manager/WebUI, AdAway, HeliBoard, Insular, serta modul ReVanced yang diperiksa terhadap checksum dan payload MicroG.
 
-1. **Integrasi Kernel `Rollercoaster-Roll.3.3` (`Linux 4.14.370`)**
-   - Patching offline otomatis `boot.img` (partisi 128 MB `miatoll`) menggunakan `magiskboot` dengan kernel `Rollercoaster-Roll.3.3.zip` (`prebuilt/kernel/`), mempertahankan DTB asli ROM bila kompatibel.
-   - Terintegrasi **KernelSU-Next v3.4.0 (`33294`)**, **SuSFS v2.3.0**, **NoMount VFS**, dan **KSUWebUI**.
-   - Seluruh partisi **EROFS** dikemas ulang menggunakan **`mkfs.erofs -zlz4hc,9`** (tanpa LZMA) agar 100% kompatibel dengan konfigurasi kernel `Roll.3.3`.
+## Verifikasi dan build
 
-2. **Root Stealth, SuSFS & Play Store Integrity**
-   - Auto-provisioning `/data/adb/ksud` beserta modul `rollercoaster_core`, `susfs4ksu`, `PlayIntegrityFork`, `TrickyStore`, dan `PropsHook` saat boot pertama.
-   - Spoofing status Bootloader Locked (`green` / `locked`) aktif otomatis.
+Push perubahan hanya menjalankan pemeriksaan sintaks dan rangkaian tes offline. Build ROM lengkap dijalankan secara manual melalui GitHub Actions (`workflow_dispatch`). Publikasi tidak berjalan otomatis: aktifkan `publish_release` hanya setelah build dan pemeriksaan hasil dinilai aman.
 
-3. **Optimasi Hardware Spesifik `joyeuse`**
-   - **2D Face Unlock** & **Side-Mounted Fingerprint** (`is_suppot_finger_fod=false`, `is_SideFingerprint=true`).
-   - **NFC (`NQNfcNci` + HCE/UICC/eSE)** khusus Redmi Note 9 Pro (`joyeuse`), **30W Mi Turbo Charge**, **Jack Audio 3.5mm**, & **IR Blaster**.
-   - Unlock **VoLTE / VoWiFi Operator Indonesia** + konfigurasi GPS cepat `id.pool.ntp.org`.
+Pre-flight dapat dijalankan dengan Python 3 dan Pillow:
 
-4. **Multimedia, Tampilan & Aplikasi Bawaan**
-   - **Dolby Atmos (Cruecy + Lunaris UI Bahasa Indonesia)** + **Google Spatial Audio** anti-konflik EQ.
-   - **Xiaomi Leica Camera v6.8** untuk sensor 64MP `joyeuse`.
-   - **Bootanimation Custom 60 FPS (`1080x2400`, `ZIP_STORED`)**: Huruf **`Rollercoaster`** jatuh dari atas, menyatu dengan **`OS`**, dan berkilau penuh warna dengan efek **Neon Glow**.
-   - Halaman **Tentang Ponsel -> Support** menampilkan pembuat **Graziemille** beserta foto profil & ikon Telegram `@Grazie_milles`.
-   - **Bahasa Indonesia (`id-ID`)** default, **Aplikasi Tema Xiaomi Global**, serta **Tema iOS Liquid Glass (`Rollercoaster_iOS_Pro.mtz`)** tersedia offline.
-   - **Debloat CN & Ad-Blocker Xiaomi**, **Google Play Ready**, **YouTube ReVanced & YT Music ReVanced** (terintegrasi KSU/NoMount tanpa MicroG), **AdAway**, dan **Sandbox AOSP (Work Profile)** via **Insular**.
+```sh
+python -m py_compile scripts/*.py
+python scripts/test_pipeline.py
+```
 
-5. **Distribusi Ganda Otomatis**
-   - **GoFile:** Mengunggah 1 file ZIP penuh siap flash.
-   - **GitHub Releases:** Mengunggah file terpecah `< 2 GB` (`.001`, `.002`, dst.) beserta `SHA256SUMS.txt` dan `build_manifest.json`.
+Build lengkap memerlukan JDK 21, Android SDK API 35/build-tools 35, `erofs-utils`, `android-sdk-libsparse-utils`, otatools, arsip ROM dasar yang SHA-256-nya cocok dengan konfigurasi, akses unduhan sumber yang dipin, serta ruang disk yang cukup. Hasil build menghasilkan ZIP ROM dan `build_manifest.json`.
+
+## Rilis
+
+Jika publikasi dipilih, pipeline mengunggah satu ZIP lengkap ke GoFile, membagi aset GitHub Release menjadi potongan di bawah 1,9 GiB, dan menyertakan `SHA256SUMS.txt`, manifest, serta catatan rilis Bahasa Indonesia.
+
+## Peringatan kompatibilitas
+
+- Flash hanya pada `joyeuse`; jangan gunakan pada `curtana`, `gram`, `excalibur`, atau perangkat lain.
+- ROM memodifikasi boot dan menonaktifkan pemeriksaan AVB pada metadata yang dipatch. Ikuti prosedur resmi untuk membuka bootloader, buat cadangan, dan pahami risiko kehilangan data/ketidakmampuan boot sebelum memasang.
+- Pengubahan properti yang dilaporkan Android tidak mengunci bootloader atau memulihkan rantai kepercayaan kriptografis. **Play Integrity/attestation, boot, audio, kamera, dan fitur radio belum dijamin**; hasilnya bergantung pada perangkat, firmware, region, operator, serta layanan pihak ketiga.
+- Manifest build mencatat bahwa pengujian perangkat fisik belum dilakukan kecuali statusnya secara eksplisit diubah setelah pengujian.

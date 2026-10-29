@@ -153,7 +153,7 @@ def generate_mtz(out_mtz: Path, unpacked_dir: Optional[Path] = None) -> Path:
     <author>Graziemille</author>
     <version>18.4</version>
     <uiVersion>15</uiVersion>
-    <description>Tema iOS Liquid Glass Offline Bawaan Rolleracoaster Hypos 4.0.1.7 (joyeuse)</description>
+    <description>Tema iOS Liquid Glass Offline Bawaan Rollercoaster Hypos 4.0.1.7 (joyeuse)</description>
 </theme>
 """
     home_wp = render_ios_wallpaper(1080, 2400, lock_variant=False)

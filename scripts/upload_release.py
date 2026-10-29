@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Upload Rolleracoaster Hypos 4.0.1.7 to GoFile (single full ZIP) and GitHub Releases (<2 GiB split parts)."""
+"""Upload Rollercoaster Hypos 4.0.1.7 to GoFile (single full ZIP) and GitHub Releases (<2 GiB split parts)."""
 
 from __future__ import annotations
 
@@ -14,7 +14,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-CHUNK_SIZE_BYTES = 1900 * 1024 * 1024  # 1900 MiB (< 2048 MiB GitHub Release asset limit)
+CHUNK_SIZE_BYTES = 1900 * 1024 * 1024  # Safely below the requested 1.9 GiB per GitHub asset
+MAX_REQUESTED_ASSET_BYTES = int(1.9 * (1024**3))
 COPY_BUF = 16 * 1024 * 1024
 
 
@@ -28,6 +29,10 @@ def sha256_file(path: Path) -> str:
 
 def split_file_for_github(src: Path, out_dir: Path, chunk_bytes: int = CHUNK_SIZE_BYTES) -> List[Path]:
     """Split a large file into .001, .002, ... parts under 2 GiB each."""
+    if chunk_bytes <= 0 or chunk_bytes >= MAX_REQUESTED_ASSET_BYTES:
+        raise ValueError(
+            f"GitHub part size must be positive and below 1.9 GiB ({chunk_bytes} bytes)"
+        )
     out_dir.mkdir(parents=True, exist_ok=True)
     total_size = src.stat().st_size
     if total_size <= chunk_bytes:
@@ -147,54 +152,86 @@ def render_release_notes(
 ) -> str:
     size_gib = manifest["output_size_bytes"] / (1024 ** 3)
     parts_md = "\n".join(
-        f"- `{p['name']}` ({p['size_mib']:.1f} MiB) — SHA256: `{p['sha256']}`"
-        for p in part_hashes
+        f"- `{part['name']}` ({part['size_mib']:.1f} MiB) — SHA-256: `{part['sha256']}`"
+        for part in part_hashes
     )
-    return f"""# 🎢 Rolleracoaster Hypos 4.0.1.7 — OFFICIAL (`joyeuse`)
+    integration = manifest.get("integration", {})
+    module_metadata = integration.get("module_metadata", {})
+    module_names = [
+        module_metadata.get(key, {}).get("name", key)
+        for key in ("susfs", "play_integrity_fork", "tricky_store", "youtube", "youtube_music")
+        if module_metadata.get(key)
+    ]
+    module_list = ", ".join(f"`{name}`" for name in module_names) or "modul yang terdaftar di manifest build"
+    camera = integration.get("leica_camera", {})
+    dolby = integration.get("dolby_spatial_audio", {})
+    props_hook = integration.get("props_hook", {})
+    camera_line = (
+        f"- **Kamera Leica v6.8:** APK tervalidasi ({camera.get('apk_size_bytes', 0) / (1024**2):.1f} MiB), "
+        f"{camera.get('split_part_count', 0)} potongan sumber digabung dan library/allowlist disiapkan."
+        if camera else "- Integrasi kamera tidak tercatat di manifest."
+    )
+    dolby_line = (
+        "- **Dolby Atmos dan audio spasial:** blob vendor, konfigurasi efek/codec dan UI DAX berbahasa Indonesia "
+        "disiapkan dari sumber yang dipin. Dukungan runtime bergantung pada HAL vendor dan perangkat."
+        if dolby else "- Integrasi Dolby/audio tidak tercatat di manifest."
+    )
+    hook_line = (
+        "- **PropsHook:** DEX disisipkan ke `framework.jar` dan panggilan Instrumentation lolos validasi arsip."
+        if props_hook else "- PropsHook tidak tercatat di manifest."
+    )
+    physical_tested = bool(manifest.get("physical_device_tested", False))
+    physical_note = (
+        "Build ini telah diuji pada perangkat fisik."
+        if physical_tested
+        else "Build ini belum diuji pada perangkat fisik; keberhasilan boot, kamera, audio, NFC, jaringan seluler, dan fitur regional belum dikonfirmasi."
+    )
+    integrity_result = manifest.get(
+        "play_integrity_result",
+        "belum diuji; hasil attestation tidak dijamin",
+    )
+    return f"""# 🎢 Rollercoaster Hypos 4.0.1.7 — `joyeuse`
 
-**Perangkat:** Xiaomi Redmi Note 9 Pro (`joyeuse` / `miatoll`)
-**Basis Sistem:** Xiaomi HyperOS `4.0.17.0` (Android 17 Port)
-**Versi ROM:** `Rolleracoaster Hypos 4.0.1.7`
-**Pembuat / Maintainer:** **Graziemille**
-**Dukungan & Komunitas Telegram:** [**@Grazie_milles**](https://t.me/Grazie_milles)
+**Perangkat target:** Xiaomi Redmi Note 9 Pro (`joyeuse` / keluarga `miatoll`)<br>
+**Basis:** Xiaomi HyperOS `{manifest.get('base_version', 'tidak dicantumkan')}` — Android {manifest.get('android_version', 'tidak dicantumkan')}<br>
+**Maintainer:** Graziemille — [@Grazie_milles](https://t.me/Grazie_milles)<br>
+**Ukuran ZIP:** {size_gib:.2f} GiB<br>
+**SHA-256 ZIP lengkap:** `{full_sha256}`
 
----
+## Unduhan
 
-## 📥 Link Download
+### ZIP lengkap — GoFile
+- [{full_zip_name}]({gofile_info['download_page']})
 
-### 1️⃣ Single Full ZIP (GoFile — Langsung Flash Tanpa Gabung File)
-- **File:** `{full_zip_name}` (`{size_gib:.2f} GiB`)
-- **Link GoFile:** [**{gofile_info['download_page']}**]({gofile_info['download_page']})
-- **SHA-256 Full ZIP:** `{full_sha256}`
-
-### 2️⃣ GitHub Releases Split Parts (`< 2 GB` per bagian)
+### Bagian GitHub Release (setiap aset di bawah 1,9 GiB)
 {parts_md}
 
-> **Cara Menggabungkan File Split GitHub Releases:**
-> - **Android (ZArchiver):** Taruh semua file `.001`, `.002`, dst. di folder yang sama → ketuk file `.001` → pilih **Ekstrak / Gabungkan** atau Termux: `cat {full_zip_name}.* > {full_zip_name}`
-> - **Windows (CMD):** `copy /b {full_zip_name}.* {full_zip_name}` (atau klik kanan `.001` di **7-Zip** → *Combine files*)
-> - **Linux / macOS:** `cat {full_zip_name}.* > {full_zip_name} && sha256sum {full_zip_name}`
+Unduh semua bagian ke satu folder dan gabungkan sesuai urutan nama. Linux/macOS/Termux:
+`cat {full_zip_name}.* > {full_zip_name}`
 
----
+Windows CMD:
+`copy /b {full_zip_name}.* {full_zip_name}`
 
-## 🔥 Fitur Utama & Optimasi Khusus `joyeuse`
+Setelah digabung, cocokkan berkas dengan nilai SHA-256 ZIP lengkap di atas. `SHA256SUMS.txt` juga menyertakan checksum setiap bagian dan manifest.
 
-- **Kernel Custom Pre-patched (`4.14.370-Rollercoaster-Roll.3.3`):**
-  - Terintegrasi **KernelSU-Next v3.4.0 (`33294`)** + **SuSFS v2.3.0** + **NoMount VFS** + **KSUWebUI**.
-  - Seluruh partisi **EROFS** dikemas ulang menggunakan kompresi **`lz4hc,9`** sehingga 100% kompatibel dengan kernel `Rollercoaster-Roll.3.3`.
-- **Root Stealth & Play Store Integrity:**
-  - Modul `susfs4ksu`, `PlayIntegrityFork`, `TrickyStore`, dan `PropsHook` otomatis terpasang sejak boot pertama.
-  - Spoofing Bootloader Locked (`green` / `locked`) aktif otomatis.
-- **Hardware `joyeuse` 100% Optimal:**
-  - **2D Face Unlock** responsif, **Side-Mounted Fingerprint** (`fod=false`), **NFC (`NQNfcNci` + HCE)** khusus `joyeuse`, **30W Mi Turbo Charge**, **Jack Audio 3.5mm**, & **IR Blaster**.
-  - Unlock **VoLTE / VoWiFi Operator Indonesia** + NTP GPS cepat `id.pool.ntp.org`.
-- **Audio, Kamera & Tampilan:**
-  - **Dolby Atmos (Cruecy + Lunaris UI Bahasa Indonesia)** + **Google Spatial Audio** anti-konflik EQ.
-  - **Xiaomi Leica Camera v6.8** untuk sensor 64MP `joyeuse` (`s5kgw1`).
-  - **Bootanimation Custom 60 FPS (`1080x2400`)**: Animasi huruf **`Rollercoaster`** jatuh dari atas, menyatu dengan **`OS`**, dan berkilau penuh warna dengan efek **Neon Glow**.
-  - Halaman **Tentang Ponsel -> Support** menampilkan pembuat **Graziemille** beserta profil & ikon Telegram [**@Grazie_milles**](https://t.me/Grazie_milles).
-  - **Bahasa Indonesia (`id-ID`)** default, **Aplikasi Tema Xiaomi Global**, & **Tema iOS Liquid Glass (`Rollercoaster_iOS_Pro.mtz`)** offline.
-  - **Bebas Bloatware CN & Iklan Xiaomi**, **Google Play Ready**, **YouTube ReVanced & YT Music ReVanced** (terintegrasi KSU tanpa MicroG), **AdAway**, dan **Sandbox AOSP (Work Profile)** via **Insular**.
+## Ringkasan build
+
+- Kernel Roll 3.3 dipasang ke `boot.img`; hasil repack boot diverifikasi melalui round-trip `magiskboot` dan ukuran boot dibatasi sesuai partisi joyeuse.
+- Modul KernelSU disertakan sebagai seed dan diproses melalui `ksud` saat boot. Modul yang sudah ada di perangkat tidak ditimpa. Periksa hasil pemasangan di aplikasi KernelSU setelah boot.
+{hook_line}
+{dolby_line}
+{camera_line}
+- Bahasa Indonesia, aplikasi Rollercoaster Support, overlay, tema MTZ, bootanimation, HeliBoard, AdAway, Insular, dan KernelSU Manager disertakan sesuai manifest.
+- Modul opsional yang dipaketkan: {module_list}.
+
+## Catatan penting
+
+- **Khusus perangkat `joyeuse`; jangan flash pada `curtana`, `gram`, `excalibur`, atau perangkat lain.** Pastikan berkas cocok dengan varian perangkat dan simpan cadangan data/firmware sebelum memasang.
+- ROM ini mengubah boot dan menonaktifkan pemeriksaan AVB pada metadata yang dipatch. Bootloader harus dibuka sesuai prosedur resmi perangkat; perubahan properti Android tidak mengunci bootloader atau memulihkan rantai kepercayaan kriptografis.
+- {physical_note}
+- Status Play Integrity/attestation: **{integrity_result}**. Hasil layanan pihak ketiga tidak dijamin; modul yang disertakan tidak menggantikan pengujian perangkat atau kebijakan penyedia layanan.
+- Flag fitur perangkat, VoLTE/VoWiFi, NFC/HCE, face unlock, Dolby, spatializer, dan kamera dapat memerlukan dukungan hardware, firmware, region, operator, serta izin yang sesuai.
+- SHA-256 di atas mengidentifikasi berkas build ini. Verifikasi checksum sebelum flashing dan hentikan pemasangan bila nilainya berbeda.
 """
 
 
@@ -237,8 +274,19 @@ def main() -> None:
     args = parser.parse_args()
 
     rom_zip = args.rom_zip.resolve()
-    manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
-    full_sha256 = manifest.get("output_sha256") or sha256_file(rom_zip)
+    manifest_path = args.manifest.resolve()
+    if not rom_zip.is_file() or not manifest_path.is_file():
+        raise FileNotFoundError("Both the ROM ZIP and its build manifest must exist before publishing")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    full_sha256 = sha256_file(rom_zip)
+    expected_sha = str(manifest.get("output_sha256", ""))
+    if expected_sha and full_sha256.lower() != expected_sha.lower():
+        raise RuntimeError(
+            f"ROM ZIP SHA-256 does not match its build manifest: {full_sha256} != {expected_sha}"
+        )
+    expected_size = manifest.get("output_size_bytes")
+    if expected_size is not None and int(expected_size) != rom_zip.stat().st_size:
+        raise RuntimeError("ROM ZIP size does not match its build manifest")
 
     gofile_info = upload_to_gofile(rom_zip)
 
@@ -248,7 +296,7 @@ def main() -> None:
         rom_zip.unlink(missing_ok=True)
 
     part_hashes: List[Dict[str, Any]] = []
-    sha_lines = [f"{full_sha256}  {rom_zip.name} (FULL SINGLE ZIP - GoFile)"]
+    sha_lines = [f"# GoFile full ZIP SHA-256: {full_sha256}  {rom_zip.name}"]
     for p in parts:
         ph = sha256_file(p)
         part_hashes.append({
@@ -259,6 +307,8 @@ def main() -> None:
         })
         sha_lines.append(f"{ph}  {p.name}")
 
+    manifest_sha256 = sha256_file(manifest_path)
+    sha_lines.append(f"{manifest_sha256}  {manifest_path.name}")
     sha_txt = split_dir / "SHA256SUMS.txt"
     sha_txt.write_text("\n".join(sha_lines) + "\n", encoding="utf-8")
 
@@ -269,7 +319,7 @@ def main() -> None:
     )
 
     assets = [*parts, sha_txt, args.manifest.resolve()]
-    release_title = "Rolleracoaster Hypos 4.0.1.7 | Redmi Note 9 Pro (joyeuse)"
+    release_title = "Rollercoaster Hypos 4.0.1.7 | Redmi Note 9 Pro (joyeuse)"
     gh_release_url = publish_github_release(
         tag=args.tag,
         title=release_title,

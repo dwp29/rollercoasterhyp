@@ -33,6 +33,8 @@ EROFS_MAGIC = 0xE0F5E1E2
 EXT4_MAGIC = 0xEF53
 
 TARGET_PARTITIONS = ("system", "system_ext", "product", "vendor", "odm", "mi_ext")
+MAX_SUPER_DEVICE_SIZE_BYTES = 9126805504  # joyeuse: 8.5 GiB logical super
+SUPER_METADATA_RESERVE_BYTES = 4 * 1024 * 1024
 
 
 @dataclass
@@ -267,53 +269,77 @@ def sparse_img_to_sdat(sparse_img: Path, out_prefix: Path) -> Tuple[Path, Path, 
 
 
 def parse_lpdump_geometry(raw_super: Path, lpdump_bin: Optional[Path], tool_env: Optional[Dict[str, str]] = None) -> SuperGeometry:
-    geom = SuperGeometry(dev_size=raw_super.stat().st_size)
-    max_group_budget = max(geom.dev_size - 4 * 1024 * 1024, 0)
+    geom = SuperGeometry(dev_size=min(raw_super.stat().st_size, MAX_SUPER_DEVICE_SIZE_BYTES))
+    max_group_budget = max(geom.dev_size - SUPER_METADATA_RESERVE_BYTES, 0)
     geom.groups = {"qti_dynamic_partitions": max_group_budget}
 
-    if not lpdump_bin or not lpdump_bin.is_file():
+    if not lpdump_bin:
         return geom
+    if not lpdump_bin.is_file():
+        raise RuntimeError(f"Configured lpdump tool does not exist: {lpdump_bin}")
+    env = os.environ.copy()
+    if tool_env:
+        env.update(tool_env)
     try:
-        env = os.environ.copy()
-        if tool_env:
-            env.update(tool_env)
-        out = subprocess.check_output([str(lpdump_bin), str(raw_super)], env=env, text=True, stderr=subprocess.DEVNULL)
-        m_size = re.search(r"Size:\s*(\d+)\s*bytes", out)
-        if m_size:
-            geom.dev_size = int(m_size.group(1))
-            max_group_budget = max(geom.dev_size - 4 * 1024 * 1024, 0)
-        m_meta = re.search(r"Metadata max size:\s*(\d+)\s*bytes", out)
-        if m_meta:
-            geom.metadata_size = int(m_meta.group(1))
-        m_slots = re.search(r"Metadata slot count:\s*(\d+)", out)
-        if m_slots:
-            geom.metadata_slots = int(m_slots.group(1))
-            geom.is_ab = geom.metadata_slots >= 3
+        out = subprocess.check_output(
+            [str(lpdump_bin), str(raw_super)],
+            env=env,
+            text=True,
+            stderr=subprocess.STDOUT,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(f"lpdump could not inspect {raw_super}: {exc}") from exc
 
-        groups: Dict[str, int] = {}
-        cur_g = None
-        for line in out.splitlines():
-            mg = re.search(r"^\s*Name:\s*(\S+)", line)
-            if mg:
-                cur_g = mg.group(1)
-            ms = re.search(r"^\s*Maximum size:\s*(\d+)\s*bytes", line)
-            if ms and cur_g and cur_g != "default":
-                g_sz = int(ms.group(1))
-                if g_sz > 0:
-                    groups[cur_g] = min(g_sz, max_group_budget)
-        if groups:
-            geom.groups = groups
+    m_size = re.search(r"Size:\s*(\d+)\s*bytes", out)
+    if not m_size:
+        raise RuntimeError("lpdump output omitted the super device Size field")
+    reported_size = int(m_size.group(1))
+    if reported_size <= 0:
+        raise RuntimeError(f"lpdump reported an invalid super device size: {reported_size}")
+    if reported_size > MAX_SUPER_DEVICE_SIZE_BYTES:
+        print(
+            f"[lpdump] Clamping reported super size {reported_size} to the joyeuse maximum "
+            f"{MAX_SUPER_DEVICE_SIZE_BYTES} bytes"
+        )
+    geom.dev_size = min(reported_size, MAX_SUPER_DEVICE_SIZE_BYTES)
+    max_group_budget = max(geom.dev_size - SUPER_METADATA_RESERVE_BYTES, 0)
 
-        cur_p = None
-        for line in out.splitlines():
-            mp = re.search(r"^\s*Name:\s*([a-zA-Z0-9_]+)$", line)
-            if mp:
-                cur_p = mp.group(1)
-            mpg = re.search(r"^\s*Group:\s*(\S+)", line)
-            if mpg and cur_p:
-                geom.part_to_group[cur_p] = mpg.group(1)
-    except Exception as exc:
-        print(f"[lpdump] Geometry fallback ({exc})")
+    m_meta = re.search(r"Metadata max size:\s*(\d+)\s*bytes", out)
+    if not m_meta:
+        raise RuntimeError("lpdump output omitted Metadata max size")
+    geom.metadata_size = int(m_meta.group(1))
+    if geom.metadata_size <= 0:
+        raise RuntimeError(f"lpdump reported an invalid metadata size: {geom.metadata_size}")
+    m_slots = re.search(r"Metadata slot count:\s*(\d+)", out)
+    if not m_slots:
+        raise RuntimeError("lpdump output omitted Metadata slot count")
+    geom.metadata_slots = int(m_slots.group(1))
+    if geom.metadata_slots <= 0:
+        raise RuntimeError(f"lpdump reported an invalid metadata slot count: {geom.metadata_slots}")
+    geom.is_ab = geom.metadata_slots >= 3
+
+    groups: Dict[str, int] = {}
+    cur_g = None
+    for line in out.splitlines():
+        mg = re.search(r"^\s*Name:\s*(\S+)", line)
+        if mg:
+            cur_g = mg.group(1)
+        ms = re.search(r"^\s*Maximum size:\s*(\d+)\s*bytes", line)
+        if ms and cur_g and cur_g != "default":
+            group_size = int(ms.group(1))
+            if group_size > 0:
+                groups[cur_g] = min(group_size, max_group_budget)
+    if groups:
+        geom.groups = groups
+
+    cur_p = None
+    for line in out.splitlines():
+        mp = re.search(r"^\s*Name:\s*([a-zA-Z0-9_]+)$", line)
+        if mp:
+            cur_p = mp.group(1)
+        mpg = re.search(r"^\s*Group:\s*(\S+)", line)
+        if mpg and cur_p:
+            geom.part_to_group[cur_p] = mpg.group(1)
     return geom
 
 
@@ -784,15 +810,24 @@ def repack_rom_workspace(
     if ws.container_type == "super":
         assert ws.super_geom is not None
         geom = ws.super_geom
+        if geom.dev_size <= 0:
+            raise RuntimeError(f"Invalid super device size: {geom.dev_size}")
+        geom.dev_size = min(geom.dev_size, MAX_SUPER_DEVICE_SIZE_BYTES)
         primary_group = next(iter(geom.groups.keys()))
         total_parts_bytes = sum(p.stat().st_size for p in rebuilt_imgs.values()) + sum(
             p.stat().st_size for p, _ in ws.unmodified_super_imgs.values()
         )
-        group_max = geom.groups[primary_group]
+        group_max = min(
+            geom.groups[primary_group],
+            geom.dev_size - SUPER_METADATA_RESERVE_BYTES,
+            MAX_SUPER_DEVICE_SIZE_BYTES - SUPER_METADATA_RESERVE_BYTES,
+        )
         if total_parts_bytes > group_max:
-            geom.dev_size = ((total_parts_bytes + 128 * 1024 * 1024 + 4095) // 4096) * 4096
-            group_max = geom.dev_size - 4 * 1024 * 1024
-            geom.groups[primary_group] = group_max
+            raise RuntimeError(
+                "Rebuilt dynamic partitions exceed the safe joyeuse super-group budget "
+                f"({total_parts_bytes} > {group_max} bytes); refusing to enlarge super.img"
+            )
+        geom.groups[primary_group] = group_max
 
         raw_or_sparse_super = rebuilt_dir / "super_repacked.img"
         lp_cmd = [
@@ -830,6 +865,37 @@ def repack_rom_workspace(
 
         lp_cmd.extend(["--output", str(raw_or_sparse_super)])
         run_cmd(lp_cmd, env_extra=tools.get("_env"))  # type: ignore[arg-type]
+        lpdump_bin = tools.get("lpdump")
+        if not lpdump_bin or not Path(lpdump_bin).is_file():
+            raise RuntimeError("otatools lpdump is required to verify the rebuilt super image")
+        verify_env = os.environ.copy()
+        if tools.get("_env"):
+            verify_env.update(tools["_env"])
+        verify_output = subprocess.check_output(
+            [str(lpdump_bin), str(raw_or_sparse_super)],
+            env=verify_env,
+            text=True,
+            stderr=subprocess.STDOUT,
+        )
+        output_size_match = re.search(r"Size:\s*(\d+)\s*bytes", verify_output)
+        if not output_size_match:
+            raise RuntimeError("lpdump could not report the rebuilt super device size")
+        output_device_size = int(output_size_match.group(1))
+        if output_device_size <= 0:
+            raise RuntimeError(f"lpdump reported an invalid rebuilt super size: {output_device_size}")
+        if output_device_size > MAX_SUPER_DEVICE_SIZE_BYTES or output_device_size > geom.dev_size:
+            raise RuntimeError(
+                "lpmake output exceeds the configured joyeuse super capacity: "
+                f"{output_device_size} > min({MAX_SUPER_DEVICE_SIZE_BYTES}, {geom.dev_size}) bytes"
+            )
+        output_slots_match = re.search(r"Metadata slot count:\s*(\d+)", verify_output)
+        if not output_slots_match:
+            raise RuntimeError("lpdump could not report metadata slots for the rebuilt super image")
+        output_slots = int(output_slots_match.group(1))
+        if output_slots != geom.metadata_slots:
+            raise RuntimeError(
+                f"Rebuilt super metadata-slot count changed unexpectedly: {output_slots} != {geom.metadata_slots}"
+            )
 
         for p in rebuilt_imgs.values():
             p.unlink(missing_ok=True)

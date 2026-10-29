@@ -73,6 +73,11 @@ def patch_boot_image(
 
     orig_boot = unpack_dir / "boot.img"
     shutil.copy2(rom_boot_img, orig_boot)
+    if orig_boot.stat().st_size > MAX_MIATOLL_BOOT_BYTES:
+        raise RuntimeError(
+            f"Input boot.img exceeds the 128 MiB joyeuse boot partition capacity "
+            f"({orig_boot.stat().st_size} > {MAX_MIATOLL_BOOT_BYTES} bytes)"
+        )
 
     res = subprocess.run(
         [str(magiskboot), "unpack", "-h", "boot.img"],
@@ -121,9 +126,11 @@ def patch_boot_image(
         raise RuntimeError("magiskboot failed to produce new-boot.img")
 
     boot_size = repacked.stat().st_size
-    size_cap = max(MAX_MIATOLL_BOOT_BYTES, orig_boot.stat().st_size)
-    if boot_size > size_cap:
-        raise RuntimeError(f"Repacked boot.img exceeds miatoll boot partition ({boot_size} > {size_cap} bytes)")
+    if boot_size > MAX_MIATOLL_BOOT_BYTES:
+        raise RuntimeError(
+            f"Repacked boot.img exceeds the 128 MiB joyeuse boot partition "
+            f"({boot_size} > {MAX_MIATOLL_BOOT_BYTES} bytes)"
+        )
 
     shutil.copy2(repacked, verify_dir / "boot.img")
     subprocess.run([str(magiskboot), "unpack", "boot.img"], cwd=str(verify_dir), check=True)
@@ -135,10 +142,11 @@ def patch_boot_image(
     shutil.copy2(repacked, out_boot_img)
 
     ksud_src = ak_dir / "ksud"
-    if ksud_src.is_file():
-        out_ksud.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(ksud_src, out_ksud)
-        out_ksud.chmod(0o755)
+    if not ksud_src.is_file() or ksud_src.stat().st_size == 0:
+        raise RuntimeError("ksud binary is missing from the pinned Rollercoaster kernel ZIP")
+    out_ksud.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(ksud_src, out_ksud)
+    out_ksud.chmod(out_ksud.stat().st_mode | 0o111)
 
     print(
         f"[boot-patcher] Patched boot.img ({boot_size / (1024 * 1024):.2f} MB) with "

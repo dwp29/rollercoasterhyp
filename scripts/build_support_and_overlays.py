@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Compile privileged Support APK & Runtime Resource Overlays (RRO) for Rolleracoaster Hypos 4.0.1.7.
+"""Compile privileged Support APK & Runtime Resource Overlays (RRO) for Rollercoaster Hypos 4.0.1.7.
 
 Builds:
   1. RollercoasterSupport.apk (id.rollercoaster.support)
      - Injects 'Rollercoaster Support' card directly into Settings -> My Device / About Phone
        via Android IA Settings category `com.android.settings.category.ia.my_device_info` +
        `com.android.settings.category.ia.device_info` + `com.android.settings.category.ia.homepage`.
-     - Displays ROM Version 'Rolleracoaster Hypos 4.0.1.7', Creator 'Graziemille',
+     - Displays ROM Version 'Rollercoaster Hypos 4.0.1.7', Creator 'Graziemille',
        live circular Telegram profile avatar fetched from https://t.me/Grazie_milles,
        official Telegram paper-plane vector badge, and one-tap button to `@Grazie_milles`.
   2. RollercoasterSettingsOverlay.apk (targets com.android.settings / com.miui.miuisettings)
      - Indonesian & English overrides for Maintainer/Creator labels -> 'Graziemille (@Grazie_milles)'
-     - ROM Version display -> 'Rolleracoaster Hypos 4.0.1.7'
+     - ROM Version display -> 'Rollercoaster Hypos 4.0.1.7'
   3. RollercoasterSystemUIOverlay.apk (targets com.android.systemui)
      - Indonesian VoLTE/VoWiFi status bar & carrier display polish
   4. RollercoasterThemeOverlay.apk (targets com.android.thememanager)
@@ -32,16 +32,25 @@ import shutil
 import subprocess
 import urllib.request
 import zipfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Dict, List, Optional
 
 from PIL import Image, ImageDraw, ImageFont
 
 
+def _sdk_version_key(path: Path) -> tuple[int, ...]:
+    return tuple(int(part) for part in re.findall(r"\d+", path.name))
+
+
 def find_sdk_tool(sdk_root: Path, tool_name: str) -> Path:
     bt_root = sdk_root / "build-tools"
     if bt_root.is_dir():
-        versions = sorted([d for d in bt_root.iterdir() if d.is_dir()], reverse=True)
+        versions = sorted(
+            (d for d in bt_root.iterdir() if d.is_dir()),
+            key=_sdk_version_key,
+            reverse=True,
+        )
         for vdir in versions:
             cand = vdir / tool_name
             if cand.is_file():
@@ -52,15 +61,15 @@ def find_sdk_tool(sdk_root: Path, tool_name: str) -> Path:
     raise FileNotFoundError(f"Android SDK tool '{tool_name}' not found under {sdk_root}")
 
 
-def find_android_jar(sdk_root: Path) -> Path:
-    plat_root = sdk_root / "platforms"
-    if plat_root.is_dir():
-        versions = sorted([d for d in plat_root.iterdir() if d.is_dir()], reverse=True)
-        for pdir in versions:
-            cand = pdir / "android.jar"
-            if cand.is_file():
-                return cand
-    raise FileNotFoundError(f"android.jar not found under {sdk_root}/platforms")
+def find_android_jar(sdk_root: Path, api_level: int = 35) -> Path:
+    """Return the pinned compile platform instead of a lexicographically chosen SDK jar."""
+    candidate = sdk_root / "platforms" / f"android-{api_level}" / "android.jar"
+    if candidate.is_file():
+        return candidate
+    raise FileNotFoundError(
+        f"Android API {api_level} platform is required; missing {candidate}. "
+        "Install platforms;android-35 before building."
+    )
 
 
 def ensure_keystore(ks_path: Path) -> Path:
@@ -130,30 +139,53 @@ def sign_and_align_apk(unsigned_apk: Path, out_apk: Path, sdk_root: Path, keysto
     return out_apk
 
 
-def fetch_telegram_avatar(username: str = "Grazie_milles") -> Image.Image:
-    """Fetch live Telegram profile photo from https://t.me/<username>, with stylized fallback."""
+def fetch_telegram_avatar(username: str = "Grazie_milles", required: bool = True) -> Image.Image:
+    """Fetch the live Telegram profile photo; a required avatar never silently becomes a monogram."""
     clean_user = username.lstrip("@")
     url = f"https://t.me/{clean_user}"
+    failure: Exception | None = None
     try:
         req = urllib.request.Request(
             url,
             headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) RollercoasterROMBuilder/4.0"},
         )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            page = resp.read().decode("utf-8", errors="ignore")
-        m = re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"', page)
-        if m:
-            img_url = html.unescape(m.group(1))
-            if img_url.startswith("http") and "telegram.org/img/t_logo" not in img_url:
-                img_req = urllib.request.Request(img_url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(img_req, timeout=15) as iresp:
-                    raw = iresp.read()
-                im = Image.open(io.BytesIO(raw)).convert("RGBA")
-                print(f"[support-apk] Downloaded live Telegram profile avatar for @{clean_user} ({im.size})")
-                return im
-    except Exception as exc:
-        print(f"[support-apk] Live avatar fetch fallback ({exc}); generating stylized monogram avatar")
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            page = resp.read(2 * 1024 * 1024).decode("utf-8", errors="ignore")
 
+        image_url = ""
+        for tag in re.findall(r"<meta\b[^>]*>", page, flags=re.IGNORECASE):
+            attrs: Dict[str, str] = {}
+            for match in re.finditer(
+                r"([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))",
+                tag,
+                flags=re.IGNORECASE,
+            ):
+                attrs[match.group(1).lower()] = next(value for value in match.groups()[1:] if value is not None)
+            if attrs.get("property", "").lower() in {"og:image", "og:image:url"} or attrs.get("name", "").lower() in {"og:image", "og:image:url"}:
+                image_url = html.unescape(attrs.get("content", "")).strip()
+                if image_url:
+                    break
+
+        if not image_url.startswith("https://") or "telegram.org/img/t_logo" in image_url:
+            raise RuntimeError(f"Telegram profile @{clean_user} did not expose a real og:image")
+        img_req = urllib.request.Request(image_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(img_req, timeout=20) as iresp:
+            raw = iresp.read(12 * 1024 * 1024 + 1)
+        if len(raw) > 12 * 1024 * 1024:
+            raise RuntimeError("Telegram avatar exceeded the 12 MiB safety limit")
+        with Image.open(io.BytesIO(raw)) as image:
+            image.verify()
+        with Image.open(io.BytesIO(raw)) as image:
+            avatar = image.convert("RGBA")
+        print(f"[support-apk] Downloaded live Telegram profile avatar for @{clean_user} ({avatar.size})")
+        return avatar
+    except Exception as exc:
+        failure = exc
+
+    if required:
+        raise RuntimeError(f"Could not fetch the real Telegram profile photo for @{clean_user}: {failure}") from failure
+
+    print(f"[support-apk] Optional live avatar unavailable ({failure}); generating a monogram fallback")
     sz = 320
     im = Image.new("RGBA", (sz, sz), (0, 0, 0, 0))
     d = ImageDraw.Draw(im)
@@ -161,8 +193,7 @@ def fetch_telegram_avatar(username: str = "Grazie_milles") -> Image.Image:
         t = y / (sz - 1)
         r = int(14 + 125 * t)
         g = int(165 - 70 * t)
-        b = int(233)
-        d.line([(0, y), (sz, y)], fill=(r, g, b, 255))
+        d.line([(0, y), (sz, y)], fill=(r, g, 233, 255))
     f_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
     font = ImageFont.truetype(f_path, 128) if Path(f_path).is_file() else ImageFont.load_default()
     bbox = d.textbbox((0, 0), "GM", font=font)
@@ -265,7 +296,7 @@ def build_support_apk(out_apk: Path, sdk_root: Path, work_dir: Path) -> Path:
     <string name="app_name">Rollercoaster Support</string>
     <string name="pref_title">Support &amp; ROM Maintainer</string>
     <string name="pref_summary">Graziemille • @Grazie_milles</string>
-    <string name="rom_title">Rolleracoaster Hypos 4.0.1.7</string>
+    <string name="rom_title">Rollercoaster Hypos 4.0.1.7</string>
     <string name="rom_device">Xiaomi Redmi Note 9 Pro (joyeuse) • Kernel Roll 3.3</string>
     <string name="creator_label">ROM Creator / Maintainer</string>
     <string name="creator_name">Graziemille</string>
@@ -280,7 +311,7 @@ def build_support_apk(out_apk: Path, sdk_root: Path, work_dir: Path) -> Path:
     <string name="app_name">Dukungan Rollercoaster</string>
     <string name="pref_title">Support &amp; Pembuat ROM</string>
     <string name="pref_summary">Graziemille • @Grazie_milles</string>
-    <string name="rom_title">Rolleracoaster Hypos 4.0.1.7</string>
+    <string name="rom_title">Rollercoaster Hypos 4.0.1.7</string>
     <string name="rom_device">Xiaomi Redmi Note 9 Pro (joyeuse) • Kernel Roll 3.3</string>
     <string name="creator_label">Pembuat ROM / Maintainer</string>
     <string name="creator_name">Graziemille</string>
@@ -665,7 +696,7 @@ def build_all_overlays(out_dir: Path, sdk_root: Path, work_root: Path) -> List[P
     <string name="rom_maintainer">Graziemille (@Grazie_milles)</string>
     <string name="maintainer_title">ROM Creator</string>
     <string name="maintainer_summary">Graziemille • @Grazie_milles</string>
-    <string name="miui_version_name">Rolleracoaster Hypos 4.0.1.7</string>
+    <string name="miui_version_name">Rollercoaster Hypos 4.0.1.7</string>
 </resources>
 """
     settings_strings_id = """<?xml version="1.0" encoding="utf-8"?>
@@ -673,7 +704,7 @@ def build_all_overlays(out_dir: Path, sdk_root: Path, work_root: Path) -> List[P
     <string name="rom_maintainer">Graziemille (@Grazie_milles)</string>
     <string name="maintainer_title">Pembuat ROM</string>
     <string name="maintainer_summary">Graziemille • @Grazie_milles</string>
-    <string name="miui_version_name">Rolleracoaster Hypos 4.0.1.7</string>
+    <string name="miui_version_name">Rollercoaster Hypos 4.0.1.7</string>
 </resources>
 """
     built.append(
@@ -729,96 +760,214 @@ def build_all_overlays(out_dir: Path, sdk_root: Path, work_root: Path) -> List[P
     return built
 
 
+DOLBY_ID_TRANSLATIONS: Dict[str, str] = {
+    "spatial_audio": "Audio Spasial",
+    "spatial_audio_bluetooth_required": "Audio Spasial hanya tersedia saat terhubung ke perangkat audio Bluetooth",
+    "app_name": "Dolby Atmos",
+    "app_name_ds1": "Audio Dolby",
+    "app_title": "Dolby Atmos",
+    "balanced": "Seimbang",
+    "bright": "Cerah",
+    "custom": "Kustom",
+    "dialogue_enhancer": "Peningkat Dialog",
+    "dolby_atmos_logo_mark": "®",
+    "dolby_atmos_mark": "Dolby Atmos",
+    "dolby_dynamic_profile": "Pemrosesan Dolby mengenali konten dan menyesuaikan audio secara otomatis untuk menghasilkan suara terbaik.",
+    "dolby_explore_atmos_learn_more": "Pelajari lebih lanjut",
+    "dolby_explore_atmos_remark": "Dolby Atmos menghadirkan pengalaman audio yang memukau dengan suara multidimensi yang mengalir di atas dan mengelilingi Anda.",
+    "ds1_power_off_text": "Audio Dolby dinonaktifkan.",
+    "dynamic": "Dinamis",
+    "explore_dolby": "Jelajahi Dolby Atmos",
+    "appearance": "Tampilan",
+    "appearance_light": "Terang",
+    "appearance_dark": "Gelap",
+    "appearance_system": "Default sistem",
+    "appearance_description": "Pilih tampilan Dolby Atmos di perangkat Anda.",
+    "appearance_light_summary": "Cerah dan bersih",
+    "appearance_dark_summary": "Nyaman dipandang",
+    "appearance_system_summary": "Ikuti tema perangkat Anda",
+    "graphic_equalizer": "Equalizer Grafis",
+    "hdmi_connected_text": "Pemrosesan Suara Dolby tidak mendukung HDMI pada perangkat seluler. Kontrol Dolby akan dinonaktifkan sementara saat perangkat HDMI tersambung.",
+    "ieq_text": "Nada Cerdas:",
+    "movie": "Film",
+    "music": "Musik",
+    "navigation_drawer_close": "Tutup panel navigasi",
+    "navigation_drawer_open": "Buka panel navigasi",
+    "no_effect": "Tanpa efek",
+    "power_off_text": "Dolby Atmos dinonaktifkan.",
+    "reset": "Atur Ulang",
+    "lock_equalizer": "Kunci equalizer",
+    "unlock_equalizer": "Buka kunci equalizer",
+    "reset_confirmation_title": "Atur ulang semua profil?",
+    "reset_confirmation_text": "Pengaturan profil akan dikembalikan ke setelan pabrik yang direkomendasikan Dolby.",
+    "reset_continue": "Lanjutkan",
+    "warm": "Hangat",
+    "volume_leveler": "Perata Volume",
+    "surround_virtualizer": "Virtualisasi Surround",
+    "dolby_settings_summary": "Suara sinematik yang kaya dan mengelilingi Anda",
+    "dolby_settings_unavailable": "Dolby Atmos sedang tidak tersedia. Coba lagi.",
+}
+
+DOLBY_NON_TRANSLATABLE = {
+    "appbar_scrolling_view_behavior",
+    "max_edit_gain",
+    "min_edit_gain",
+}
+
+
+def write_indonesian_dolby_strings(res_root: Path) -> int:
+    """Write complete `values-in` and `values-id` resources from the DAX UI's source keys."""
+    base_strings = res_root / "values" / "strings.xml"
+    if not base_strings.is_file():
+        raise FileNotFoundError(f"Dolby DAX source strings are missing: {base_strings}")
+    try:
+        base_root = ET.parse(base_strings).getroot()
+    except ET.ParseError as exc:
+        raise RuntimeError(f"Invalid Dolby DAX source strings XML: {exc}") from exc
+
+    source_values: Dict[str, str] = {}
+    required_keys = set()
+    for item in base_root.findall("string"):
+        name = item.get("name", "")
+        if not name:
+            continue
+        source_values[name] = item.text or ""
+        if item.get("translatable", "true").lower() != "false" and name not in DOLBY_NON_TRANSLATABLE:
+            required_keys.add(name)
+
+    missing = sorted(required_keys - DOLBY_ID_TRANSLATIONS.keys())
+    unknown = sorted(DOLBY_ID_TRANSLATIONS.keys() - source_values.keys())
+    if missing or unknown:
+        raise RuntimeError(
+            "Dolby Indonesian translation coverage changed: "
+            f"missing={missing}, unknown={unknown}"
+        )
+
+    for key in required_keys:
+        source_placeholders = sorted(re.findall(r"%(?:\d+\$)?[-+#0-9.]*[a-zA-Z%]", source_values.get(key, "")))
+        translated_placeholders = sorted(re.findall(r"%(?:\d+\$)?[-+#0-9.]*[a-zA-Z%]", DOLBY_ID_TRANSLATIONS[key]))
+        if source_placeholders != translated_placeholders:
+            raise RuntimeError(f"Placeholder mismatch in Dolby translation key {key}")
+
+    for locale_dir in ("values-in", "values-id"):
+        root = ET.Element("resources")
+        for item in base_root.findall("string"):
+            name = item.get("name", "")
+            if not name or name not in required_keys:
+                continue
+            ET.SubElement(root, "string", {"name": name}).text = DOLBY_ID_TRANSLATIONS[name]
+        ET.indent(root, space="    ")
+        out_dir = res_root / locale_dir
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ET.ElementTree(root).write(
+            out_dir / "strings.xml",
+            encoding="utf-8",
+            xml_declaration=True,
+        )
+    print(f"[dolby-ui] Wrote {len(required_keys)} translated source strings to values-in and values-id")
+    return len(required_keys)
+
+
+def _create_temporary_dolby_signing_store(path: Path) -> None:
+    if path.is_file():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    keytool = shutil.which("keytool")
+    if not keytool:
+        raise FileNotFoundError("keytool is required to build the Dolby DAX UI")
+    subprocess.run(
+        [
+            keytool,
+            "-genkeypair",
+            "-v",
+            "-keystore",
+            str(path),
+            "-storetype",
+            "PKCS12",
+            "-alias",
+            "platform",
+            "-keyalg",
+            "RSA",
+            "-keysize",
+            "2048",
+            "-validity",
+            "10000",
+            "-storepass",
+            "android",
+            "-keypass",
+            "android",
+            "-dname",
+            "CN=Temporary Rollercoaster build key, OU=Build, O=Rollercoaster, C=ID",
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
 def inject_indonesian_dolby_strings_and_build(
     dolby_repo_dir: Path,
     out_apk: Path,
     sdk_root: Path,
     work_dir: Path,
-) -> Optional[Path]:
-    """Inject Lunaris-style Bahasa Indonesia resources into AndroidOne vendor_dolby DolbyManager & compile APK."""
-    dax_dir = dolby_repo_dir / "DolbyManager"
-    if not dax_dir.is_dir():
-        candidates = list(dolby_repo_dir.glob("*Dolby*")) + list(dolby_repo_dir.glob("*Dax*"))
-        dax_dir = next((c for c in candidates if (c / "res").is_dir()), Path(""))
-    if not dax_dir or not dax_dir.is_dir():
-        print("[dolby-ui] DolbyManager source dir not found; will use RRO Indonesian Dolby overlay")
-        return None
+) -> Path:
+    """Translate and compile the AndroidOne `DolbyDaxUI/app` source; do not substitute an overlay."""
+    source_root = dolby_repo_dir / "DolbyDaxUI"
+    source_app = source_root / "app"
+    if not (source_app / "src" / "main" / "res" / "values" / "strings.xml").is_file():
+        raise FileNotFoundError(f"Required AndroidOne Dolby DAX UI source not found: {source_app}")
+    if not (source_root / "gradlew").is_file():
+        raise FileNotFoundError(f"Dolby DAX Gradle wrapper is missing: {source_root / 'gradlew'}")
 
-    id_strings = """<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <string name="app_name">Dolby Atmos</string>
-    <string name="dolby_on">Aktif</string>
-    <string name="dolby_off">Nonaktif</string>
-    <string name="dynamic">Dinamis</string>
-    <string name="movie">Film</string>
-    <string name="music">Musik</string>
-    <string name="custom">Kustom</string>
-    <string name="dialogue_enhancer">Peningkat Dialog</string>
-    <string name="volume_leveler">Perata Volume</string>
-    <string name="bass_enhancer">Penguat Bass</string>
-    <string name="stereo_widening">Pelebaran Stereo</string>
-    <string name="spatial_audio">Audio Spasial</string>
-    <string name="reset">Atur Ulang</string>
-</resources>
-"""
-    res_root = dax_dir / "res"
-    base_strings_xml = res_root / "values" / "strings.xml"
-    valid_keys = set()
-    if base_strings_xml.is_file():
-        valid_keys = set(re.findall(r'<string\s+name="([^"]+)"', base_strings_xml.read_text(encoding="utf-8", errors="ignore")))
+    shutil.rmtree(work_dir, ignore_errors=True)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    build_root = work_dir / "DolbyDaxUI"
+    shutil.copytree(source_root, build_root)
+    res_root = build_root / "app" / "src" / "main" / "res"
+    translation_count = write_indonesian_dolby_strings(res_root)
 
-    filtered_lines = ['<?xml version="1.0" encoding="utf-8"?>', "<resources>"]
-    for m in re.finditer(r'(<string\s+name="([^"]+)">.*?</string>)', id_strings):
-        full_tag, kname = m.group(1), m.group(2)
-        if not valid_keys or kname in valid_keys:
-            filtered_lines.append(f"    {full_tag}")
-    filtered_lines.append("</resources>\n")
-    final_id_xml = "\n".join(filtered_lines)
+    manifest_path = build_root / "app" / "src" / "main" / "AndroidManifest.xml"
+    if manifest_path.is_file():
+        manifest_text = manifest_path.read_text(encoding="utf-8", errors="ignore")
+        manifest_text = re.sub(r'\s*android:sharedUserId="[^"]+"', "", manifest_text)
+        manifest_path.write_text(manifest_text, encoding="utf-8")
 
-    for loc in ("values-in", "values-id"):
-        ldir = res_root / loc
-        ldir.mkdir(parents=True, exist_ok=True)
-        (ldir / "strings.xml").write_text(final_id_xml, encoding="utf-8")
+    # Upstream config expects a platform.p12. The disposable build key lets Gradle compile;
+    # the finished APK is re-aligned and signed with the ROM's build key afterwards.
+    _create_temporary_dolby_signing_store(build_root / "platform.p12")
+    wrapper = build_root / "gradlew"
+    wrapper.chmod(0o755)
+    env = os.environ.copy()
+    env["ANDROID_HOME"] = str(sdk_root)
+    env["ANDROID_SDK_ROOT"] = str(sdk_root)
+    env.setdefault("JAVA_HOME", os.environ.get("JAVA_HOME", ""))
+    cmd = ["./gradlew", ":app:assembleRelease", "-x", "lint", "-x", "lintVitalRelease", "--no-daemon"]
+    proc = subprocess.run(cmd, cwd=str(build_root), env=env, capture_output=True, text=True)
+    if proc.returncode != 0:
+        detail = (proc.stdout + "\n" + proc.stderr)[-6000:]
+        raise RuntimeError(f"Dolby DAX UI Gradle compilation failed:\n{detail}")
 
-    gradle_bin = shutil.which("gradle")
-    if (dax_dir / "gradlew").is_file() or gradle_bin:
-        shutil.rmtree(work_dir, ignore_errors=True)
-        shutil.copytree(dax_dir, work_dir / "dax")
-        bdir = work_dir / "dax"
-        manifest_p = bdir / "AndroidManifest.xml"
-        if manifest_p.is_file():
-            mtxt = manifest_p.read_text(encoding="utf-8", errors="ignore")
-            mtxt = re.sub(r'\s*android:sharedUserId="[^"]+"', "", mtxt)
-            manifest_p.write_text(mtxt, encoding="utf-8")
+    apk_candidates = sorted((build_root / "app" / "build" / "outputs" / "apk" / "release").glob("*.apk"))
+    if not apk_candidates:
+        raise RuntimeError("Gradle completed without producing the Dolby DAX release APK")
+    unsigned_or_gradle_signed_apk = apk_candidates[0]
+    with zipfile.ZipFile(unsigned_or_gradle_signed_apk, "r") as apk_zip:
+        bad = apk_zip.testzip()
+        if bad:
+            raise RuntimeError(f"Gradle produced an invalid Dolby DAX APK entry: {bad}")
+        entries = set(apk_zip.namelist())
+        if "classes.dex" not in entries or "AndroidManifest.xml" not in entries:
+            raise RuntimeError("Built Dolby DAX APK is missing required Android package entries")
 
-        env = os.environ.copy()
-        env["ANDROID_HOME"] = str(sdk_root)
-        env["ANDROID_SDK_ROOT"] = str(sdk_root)
-        cmd = ["./gradlew", "assembleRelease", "-x", "lint", "-x", "lintVitalRelease", "--no-daemon"] if (bdir / "gradlew").is_file() else [gradle_bin, "assembleRelease", "-x", "lint", "-x", "lintVitalRelease", "--no-daemon"]
-        if (bdir / "gradlew").is_file():
-            (bdir / "gradlew").chmod(0o755)
-        proc = subprocess.run(cmd, cwd=str(bdir), env=env, capture_output=True, text=True)
-        if proc.returncode == 0:
-            apks = list(bdir.rglob("*.apk"))
-            if apks:
-                keystore = ensure_keystore(work_dir.parent / "rollercoaster.jks")
-                return sign_and_align_apk(apks[0], out_apk, sdk_root, keystore)
-        else:
-            print(f"[dolby-ui] Gradle build note: {proc.stderr[-400:]}")
-
-    build_rro_overlay_apk(
-        pkg_name="id.rollercoaster.overlay.dolby",
-        target_pkg="com.dolby.daxappui",
-        res_files={
-            "values-in/strings.xml": id_strings,
-            "values-id/strings.xml": id_strings,
-        },
-        out_apk=out_apk.with_name("RollercoasterDolbyOverlay.apk"),
-        sdk_root=sdk_root,
-        work_dir=work_dir / "ov_dolby",
+    keystore = ensure_keystore(work_dir.parent / "rollercoaster.jks")
+    result = sign_and_align_apk(unsigned_or_gradle_signed_apk, out_apk, sdk_root, keystore)
+    if not result.is_file() or result.stat().st_size == 0:
+        raise RuntimeError("Signed Dolby DAX UI APK was not created")
+    print(
+        f"[dolby-ui] Built Indonesian DolbyDaxUI.apk ({translation_count} strings, "
+        f"{result.stat().st_size / 1024:.1f} KB)"
     )
-    return None
-
+    return result
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build RollercoasterSupport.apk and RRO overlays")
