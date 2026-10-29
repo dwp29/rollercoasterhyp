@@ -14,8 +14,8 @@ Key guarantee for Rollercoaster-Roll.3.3 (`4.14.370`):
     `mkfs.erofs -zlz4hc,9` (high-compression LZ4HC, 100% kernel-compatible, zero bootloops!).
   - Extracted EROFS trees have read-only 0444/0555 modes normalized via `make_tree_writable`
     so downstream modding & cleanup never fail with PermissionError.
-  - `SuperGeometry` keeps dynamic groups within the device cap, compacting ext4 images and
-    only expanding a single non-A/B group into otherwise unused super space when necessary.
+  - `SuperGeometry` separates Virtual A/B metadata flags from slot-suffixed layouts, sizes
+    ext4 images from measured filesystem usage, and keeps rebuilt groups inside the device cap.
 """
 
 from __future__ import annotations
@@ -45,7 +45,8 @@ class SuperGeometry:
     reported_dev_size: int = 0
     metadata_size: int = 65536
     metadata_slots: int = 2
-    is_ab: bool = False
+    is_ab: bool = False  # True only when partitions/groups use slot suffixes.
+    virtual_ab: bool = False  # LP_HEADER_FLAG_VIRTUAL_AB_DEVICE, independent of slot suffixes.
     slot_suffix: str = ""
     groups: Dict[str, int] = field(default_factory=lambda: {"qti_dynamic_partitions": 9122611200})
     part_to_group: Dict[str, str] = field(default_factory=dict)
@@ -102,34 +103,39 @@ def find_host_tool(name: str) -> Optional[Path]:
     return None
 
 
-def compact_ext4_image(
-    image_path: Path,
-    resize2fs_bin: Optional[Path] = None,
-    e2fsck_bin: Optional[Path] = None,
-) -> Path:
-    """Shrink a freshly built read-only ext4 partition to its minimum valid size."""
-    resize2fs = resize2fs_bin or find_host_tool("resize2fs")
-    e2fsck = e2fsck_bin or find_host_tool("e2fsck")
-    if resize2fs is None or e2fsck is None:
-        missing = [name for name, path in (("resize2fs", resize2fs), ("e2fsck", e2fsck)) if path is None]
-        raise RuntimeError(f"Required e2fsprogs utilities are unavailable for safe ext4 compaction: {missing}")
-    if not image_path.is_file() or image_path.stat().st_size == 0:
-        raise RuntimeError(f"Cannot compact missing or empty ext4 image: {image_path}")
+def read_ext4_block_usage(image_path: Path) -> Tuple[int, int, int]:
+    """Return (total_blocks, free_blocks, block_size) from an ext4 superblock."""
+    if not image_path.is_file() or image_path.stat().st_size < 2048:
+        raise RuntimeError(f"Cannot inspect missing or truncated ext4 image: {image_path}")
+    with image_path.open("rb") as image:
+        image.seek(1024)
+        superblock = image.read(1024)
+    if len(superblock) != 1024 or struct.unpack_from("<H", superblock, 56)[0] != EXT4_MAGIC:
+        raise RuntimeError(f"Invalid ext4 superblock in {image_path}")
 
-    original_size = image_path.stat().st_size
-    run_cmd([str(resize2fs), "-M", str(image_path)])
-    compacted_size = image_path.stat().st_size
-    if compacted_size <= 0 or compacted_size > original_size or compacted_size % 4096:
+    total_blocks = struct.unpack_from("<I", superblock, 4)[0]
+    free_blocks = struct.unpack_from("<I", superblock, 12)[0]
+    block_size = 1024 << struct.unpack_from("<I", superblock, 24)[0]
+    feature_incompat = struct.unpack_from("<I", superblock, 96)[0]
+    if feature_incompat & 0x80:  # EXT4_FEATURE_INCOMPAT_64BIT
+        total_blocks |= struct.unpack_from("<I", superblock, 0x150)[0] << 32
+        free_blocks |= struct.unpack_from("<I", superblock, 0x158)[0] << 32
+    if total_blocks <= 0 or free_blocks > total_blocks or block_size <= 0:
+        raise RuntimeError(f"Invalid ext4 block counters in {image_path}")
+    if total_blocks * block_size != image_path.stat().st_size:
         raise RuntimeError(
-            f"resize2fs produced an invalid compacted image size for {image_path.name}: "
-            f"{compacted_size} bytes (original {original_size})"
+            f"Ext4 image length does not match its superblock in {image_path}: "
+            f"{image_path.stat().st_size} != {total_blocks * block_size}"
         )
-    run_cmd([str(e2fsck), "-f", "-n", str(image_path)])
-    print(
-        f"[repack-fs] Compacted {image_path.name}: "
-        f"{original_size / (1024**2):.1f} -> {compacted_size / (1024**2):.1f} MiB"
-    )
-    return image_path
+    return total_blocks, free_blocks, block_size
+
+
+def ext4_target_block_count(used_blocks: int) -> int:
+    """Add 0.1% headroom (at least 2 MiB) to measured ext4 allocation."""
+    if used_blocks <= 0:
+        raise ValueError("used_blocks must be positive")
+    reserve_blocks = max(512, (used_blocks + 999) // 1000)
+    return used_blocks + reserve_blocks
 
 
 def make_tree_writable(root: Path) -> None:
@@ -324,6 +330,7 @@ LP_METADATA_MAJOR_VERSION = 10
 LP_METADATA_MINOR_VERSION_MAX = 2
 LP_PARTITION_ATTR_SLOT_SUFFIXED = 1 << 1
 LP_GROUP_SLOT_SUFFIXED = 1 << 0
+LP_HEADER_FLAG_VIRTUAL_AB_DEVICE = 1 << 0
 
 
 class _SuperImageReader:
@@ -507,7 +514,7 @@ def _parse_lp_metadata_copy(
     metadata_size: int,
     metadata_slots: int,
     metadata_offset: int,
-) -> Tuple[int, int, Dict[str, int], Dict[str, str], bool]:
+) -> Tuple[int, int, Dict[str, int], Dict[str, str], bool, bool]:
     header_prefix = reader.read(metadata_offset, 128)
     magic, major_version, minor_version, header_size = struct.unpack_from("<IHHI", header_prefix, 0)
     if magic != LP_METADATA_HEADER_MAGIC:
@@ -524,7 +531,8 @@ def _parse_lp_metadata_copy(
     if hashlib.sha256(normalized_header).digest() != expected_header_checksum:
         raise RuntimeError("metadata header SHA-256 checksum mismatch")
     header_flags = struct.unpack_from("<I", header, 128)[0] if header_size >= 132 else 0
-    has_slot_specific_layout = bool(header_flags & 0x1)  # LP_HEADER_FLAG_VIRTUAL_AB_DEVICE
+    virtual_ab = bool(header_flags & LP_HEADER_FLAG_VIRTUAL_AB_DEVICE)
+    has_slot_specific_layout = False
 
     tables_size = struct.unpack_from("<I", header, 44)[0]
     expected_tables_checksum = header[48:80]
@@ -632,7 +640,7 @@ def _parse_lp_metadata_copy(
         for name, _flags, maximum_size in groups
         if name != "default" and maximum_size > 0
     }
-    return device_size, metadata_slots, group_limits, partition_to_group, has_slot_specific_layout
+    return device_size, metadata_slots, group_limits, partition_to_group, virtual_ab, has_slot_specific_layout
 
 
 def parse_super_geometry(super_image: Path) -> SuperGeometry:
@@ -643,7 +651,7 @@ def parse_super_geometry(super_image: Path) -> SuperGeometry:
         primary_offset = LP_PARTITION_RESERVED_BYTES + 2 * LP_METADATA_GEOMETRY_SIZE
         backup_offset = primary_offset + metadata_size * metadata_slots
         errors: List[str] = []
-        parsed: Optional[Tuple[int, int, Dict[str, int], Dict[str, str], bool]] = None
+        parsed: Optional[Tuple[int, int, Dict[str, int], Dict[str, str], bool, bool]] = None
         for offset in (primary_offset, backup_offset):
             try:
                 parsed = _parse_lp_metadata_copy(reader, metadata_size, metadata_slots, offset)
@@ -653,7 +661,7 @@ def parse_super_geometry(super_image: Path) -> SuperGeometry:
         if parsed is None:
             raise RuntimeError("Invalid LP metadata in primary and backup copies: " + "; ".join(errors))
 
-        reported_size, parsed_slots, raw_groups, part_to_group, slot_specific_layout = parsed
+        reported_size, parsed_slots, raw_groups, part_to_group, virtual_ab, slot_specific_layout = parsed
         if parsed_slots != metadata_slots:
             raise RuntimeError("LP metadata slot count changed while reading geometry")
         if reported_size > MAX_SUPER_DEVICE_SIZE_BYTES:
@@ -675,7 +683,8 @@ def parse_super_geometry(super_image: Path) -> SuperGeometry:
             reported_dev_size=reported_size,
             metadata_size=metadata_size,
             metadata_slots=metadata_slots,
-            is_ab=metadata_slots >= 3 or slot_specific_layout,
+            is_ab=slot_specific_layout,
+            virtual_ab=virtual_ab,
             groups=groups,
             part_to_group=part_to_group,
         )
@@ -683,22 +692,78 @@ def parse_super_geometry(super_image: Path) -> SuperGeometry:
         reader.close()
 
 
-def safe_primary_group_budget(geom: SuperGeometry, primary_group: str, required_bytes: int) -> int:
-    """Return a safe LP group cap, using free device space only for a single non-A/B group."""
-    if primary_group not in geom.groups:
-        raise RuntimeError(f"Primary dynamic group is missing from LP metadata: {primary_group}")
+def _slot_group_name(group_name: str, suffix: str) -> str:
+    """Map a source LP group to a concrete slot group when rebuilding slot A/B."""
+    if group_name == "default" or suffix not in ("_a", "_b"):
+        return group_name
+    if group_name.endswith("_a") or group_name.endswith("_b"):
+        return group_name[:-2] + suffix
+    return group_name + suffix
+
+
+def _source_group_limit(geom: SuperGeometry, output_group: str) -> Optional[int]:
+    if output_group in geom.groups:
+        return geom.groups[output_group]
+    if output_group.endswith("_a") or output_group.endswith("_b"):
+        return geom.groups.get(output_group[:-2])
+    return None
+
+
+def calculate_safe_group_caps(geom: SuperGeometry, group_usage: Dict[str, int]) -> Dict[str, int]:
+    """Fit LP group limits to rebuilt images without exceeding the physical super budget.
+
+    Slot-suffixed A/B layouts keep their source group limits. Non-slot-suffixed layouts
+    may redistribute unused group capacity, because LP group limits are logical maxima;
+    the actual rebuilt image bytes are separately bounded by the physical device budget.
+    """
     device_budget = min(geom.dev_size, MAX_SUPER_DEVICE_SIZE_BYTES) - SUPER_METADATA_RESERVE_BYTES
     if device_budget <= 0:
         raise RuntimeError(f"Invalid dynamic-partition capacity after metadata reserve: {device_budget}")
+    total_required = sum(max(0, size) for size in group_usage.values())
+    if total_required > device_budget:
+        raise RuntimeError(
+            "Rebuilt dynamic partitions exceed the safe joyeuse super-device budget "
+            f"({total_required} > {device_budget} bytes)"
+        )
 
-    source_group_budget = min(geom.groups[primary_group], device_budget)
-    if (
-        required_bytes > source_group_budget
-        and not geom.is_ab
-        and len(geom.groups) == 1
-    ):
-        return device_budget
-    return source_group_budget
+    if geom.is_ab:
+        for group_name, required in group_usage.items():
+            if required <= 0 or group_name == "default":
+                continue
+            source_limit = _source_group_limit(geom, group_name)
+            if source_limit is None:
+                raise RuntimeError(f"No source LP group limit exists for slot group {group_name}")
+            if required > source_limit:
+                raise RuntimeError(
+                    f"Slot-suffixed LP group {group_name} requires {required} bytes, "
+                    f"above its preserved source limit {source_limit} bytes"
+                )
+        return dict(geom.groups)
+
+    active_usage = {
+        name: size
+        for name, size in group_usage.items()
+        if name != "default" and size > 0
+    }
+    caps: Dict[str, int] = {}
+    remaining = device_budget - total_required
+    for group_name in sorted(active_usage):
+        required = active_usage[group_name]
+        source_limit = geom.groups.get(group_name, required)
+        preserved_headroom = min(max(source_limit - required, 0), remaining)
+        caps[group_name] = required + preserved_headroom
+        remaining -= preserved_headroom
+
+    if remaining > 0 and caps:
+        # Put any otherwise-unused physical slack in the largest active group. This keeps
+        # the aggregate group maxima bounded while allowing a single-group layout to use
+        # its full safe device budget rather than retaining an obsolete smaller source cap.
+        largest_group = max(active_usage, key=active_usage.get)
+        caps[largest_group] += remaining
+
+    if sum(caps.values()) + group_usage.get("default", 0) > device_budget:
+        raise RuntimeError("Internal error: recalculated LP group caps exceed the device budget")
+    return caps
 
 
 def escape_fc_regex(path_str: str) -> str:
@@ -728,6 +793,21 @@ def sync_fs_config_and_contexts(
             existing_fc_lines.append(ln)
             existing_fc_keys.add(ln.split()[0])
 
+    def clean_fs_config_line(line: str) -> str:
+        """Keep Android fs_config's path/uid/gid/mode/capability fields only."""
+        fields = line.split()
+        if len(fields) > 5:
+            fields = fields[:5]
+        if len(fields) == 5:
+            try:
+                int(fields[4], 0)
+            except ValueError:
+                # Some extractors append a symlink target after mode; e2fsdroid treats
+                # that string as an invalid capability token. The filesystem tree itself
+                # carries the symlink target, so omit it from fs_config.
+                fields = fields[:4]
+        return " ".join(fields)
+
     default_ctx = "u:object_r:vendor_file:s0" if part_name in ("vendor", "odm") else "u:object_r:system_file:s0"
 
     def infer_context(rel_posix: str) -> str:
@@ -754,7 +834,7 @@ def sync_fs_config_and_contexts(
     new_fsc_lines: List[str] = []
     for root_k in ("/", part_name, f"{part_name}/"):
         if root_k in existing_fsc:
-            new_fsc_lines.append(existing_fsc[root_k])
+            new_fsc_lines.append(clean_fs_config_line(existing_fsc[root_k]))
     if not new_fsc_lines:
         new_fsc_lines.extend(["/ 0 0 0755", f"{part_name} 0 0 0755"])
 
@@ -772,12 +852,11 @@ def sync_fs_config_and_contexts(
             fsc_key = f"{part_name}/{rel_item}"
             if fsc_key in existing_fsc:
                 if fsc_key not in seen_fsc:
-                    new_fsc_lines.append(existing_fsc[fsc_key])
+                    new_fsc_lines.append(clean_fs_config_line(existing_fsc[fsc_key]))
                     seen_fsc.add(fsc_key)
             else:
                 if is_link:
-                    target = os.readlink(full_entry)
-                    new_fsc_lines.append(f"{fsc_key} 0 0 0777 {target}")
+                    new_fsc_lines.append(f"{fsc_key} 0 0 0777")
                 elif is_dir:
                     gid = 2000 if ("/bin" in f"/{fsc_key}" or fsc_key.endswith("/bin")) else 0
                     mode = "0700" if fsc_key == f"{part_name}/lost+found" else "0755"
@@ -915,47 +994,82 @@ def rebuild_partition_img(
         tree_bytes = int(du_out)
         img_bytes = max(int(tree_bytes * 1.16) + 64 * 1024 * 1024, 128 * 1024 * 1024)
         img_bytes = ((img_bytes + 4095) // 4096) * 4096
-        blocks_4k = img_bytes // 4096
+        initial_blocks = img_bytes // 4096
         mke2fs = mke2fs_bin or find_host_tool("mke2fs")
         e2fsdroid = e2fsdroid_bin or find_host_tool("e2fsdroid")
-        if mke2fs is None or e2fsdroid is None:
-            missing = [name for name, path in (("mke2fs", mke2fs), ("e2fsdroid", e2fsdroid)) if path is None]
+        e2fsck = find_host_tool("e2fsck")
+        if mke2fs is None or e2fsdroid is None or e2fsck is None:
+            missing = [
+                name
+                for name, path in (("mke2fs", mke2fs), ("e2fsdroid", e2fsdroid), ("e2fsck", e2fsck))
+                if path is None
+            ]
             raise RuntimeError(f"Required ext4 image tools are unavailable: {missing}")
-        run_cmd(
-            [
-                str(mke2fs),
-                "-O",
-                "^has_journal",
-                "-m",
-                "0",
-                "-L",
-                rec.base_name,
-                "-t",
-                "ext4",
-                "-b",
-                "4096",
-                str(out_raw_img),
-                str(blocks_4k),
-            ]
+
+        def build_ext4_at_size(block_count: int) -> Tuple[int, int, int]:
+            out_raw_img.unlink(missing_ok=True)
+            run_cmd(
+                [
+                    str(mke2fs),
+                    "-O",
+                    "^has_journal",
+                    "-m",
+                    "0",
+                    "-L",
+                    rec.base_name,
+                    "-t",
+                    "ext4",
+                    "-b",
+                    "4096",
+                    str(out_raw_img),
+                    str(block_count),
+                ]
+            )
+            run_cmd(
+                [
+                    str(e2fsdroid),
+                    "-e",
+                    "-T",
+                    timestamp,
+                    "-C",
+                    str(rec.fs_config_path),
+                    "-S",
+                    str(rec.file_contexts_path),
+                    "-f",
+                    str(rec.extract_dir),
+                    "-a",
+                    f"/{rec.base_name}",
+                    str(out_raw_img),
+                ]
+            )
+            return read_ext4_block_usage(out_raw_img)
+
+        stage_total, stage_free, block_size = build_ext4_at_size(initial_blocks)
+        if block_size != 4096:
+            raise RuntimeError(f"Unexpected ext4 block size for {rec.base_name}: {block_size}")
+        stage_used = stage_total - stage_free
+        target_blocks = ext4_target_block_count(stage_used)
+        if target_blocks < stage_total:
+            print(
+                f"[repack-fs] Rebuilding {rec.base_name}.img from measured usage: "
+                f"{stage_total} -> {target_blocks} blocks ({stage_used} used)"
+            )
+            final_total, final_free, final_block_size = build_ext4_at_size(target_blocks)
+        else:
+            final_total, final_free, final_block_size = stage_total, stage_free, block_size
+
+        if final_block_size != 4096 or final_total * final_block_size != out_raw_img.stat().st_size:
+            raise RuntimeError(f"Final ext4 geometry is inconsistent for {rec.base_name}")
+        if final_free < 256:
+            raise RuntimeError(
+                f"Tight-fit ext4 image {rec.base_name} has less than 1 MiB of free filesystem space "
+                f"({final_free} blocks); refusing an unsafe image"
+            )
+        run_cmd([str(e2fsck), "-f", "-n", str(out_raw_img)])
+        print(
+            f"[repack-fs] Tight-fit {rec.base_name}.img: "
+            f"{final_total} blocks, {final_free} free, {out_raw_img.stat().st_size / (1024**2):.1f} MiB"
         )
-        run_cmd(
-            [
-                str(e2fsdroid),
-                "-e",
-                "-T",
-                timestamp,
-                "-C",
-                str(rec.fs_config_path),
-                "-S",
-                str(rec.file_contexts_path),
-                "-f",
-                str(rec.extract_dir),
-                "-a",
-                f"/{rec.base_name}",
-                str(out_raw_img),
-            ]
-        )
-        compact_ext4_image(out_raw_img)
     else:
         raise RuntimeError(f"Unsupported fs_type {rec.fs_type}")
 
@@ -1203,27 +1317,65 @@ def repack_rom_workspace(
         if geom.dev_size <= 0:
             raise RuntimeError(f"Invalid super device size: {geom.dev_size}")
         geom.dev_size = min(geom.dev_size, MAX_SUPER_DEVICE_SIZE_BYTES)
-        primary_group = next(iter(geom.groups.keys()))
-        total_parts_bytes = sum(p.stat().st_size for p in rebuilt_imgs.values()) + sum(
-            p.stat().st_size for p, _ in ws.unmodified_super_imgs.values()
+        primary_group = next(iter(geom.groups.keys()), "qti_dynamic_partitions")
+        print(
+            "[LP metadata] Source layout: "
+            f"slot_suffixed={geom.is_ab}, virtual_ab={geom.virtual_ab}, "
+            f"metadata_slots={geom.metadata_slots}, slot_suffix={geom.slot_suffix or '(none)'}, "
+            f"device_bytes={geom.dev_size}, source_groups={geom.groups}, "
+            f"partition_groups={dict(sorted(geom.part_to_group.items()))}"
         )
-        source_group_max = geom.groups[primary_group]
-        group_max = safe_primary_group_budget(geom, primary_group, total_parts_bytes)
-        if group_max > source_group_max:
-            print(
-                f"[LP metadata] Expanded the only non-A/B dynamic group {primary_group} "
-                f"from {source_group_max} to {group_max} bytes, within the joyeuse super-device cap"
+
+        rebuilt_group_map: Dict[str, str] = {}
+        unmodified_group_map: Dict[str, str] = {}
+        group_usage: Dict[str, int] = {}
+        for base, image_path in rebuilt_imgs.items():
+            partition_name = f"{base}{geom.slot_suffix}"
+            group_name = geom.part_to_group.get(
+                partition_name,
+                geom.part_to_group.get(base, primary_group),
             )
-        if total_parts_bytes > group_max:
-            partition_sizes = ", ".join(
-                f"{name}={path.stat().st_size}" for name, path in sorted(rebuilt_imgs.items())
+            if geom.is_ab and geom.slot_suffix in ("_a", "_b"):
+                group_name = _slot_group_name(group_name, geom.slot_suffix)
+            rebuilt_group_map[base] = group_name
+            group_usage[group_name] = group_usage.get(group_name, 0) + image_path.stat().st_size
+
+        for stem, (image_path, source_group) in ws.unmodified_super_imgs.items():
+            group_name = source_group
+            if geom.is_ab and geom.slot_suffix in ("_a", "_b"):
+                group_name = _slot_group_name(group_name, geom.slot_suffix)
+            unmodified_group_map[stem] = group_name
+            group_usage[group_name] = group_usage.get(group_name, 0) + image_path.stat().st_size
+
+        total_parts_bytes = sum(group_usage.values())
+        device_budget = geom.dev_size - SUPER_METADATA_RESERVE_BYTES
+        if device_budget <= 0:
+            raise RuntimeError(f"Invalid dynamic-partition capacity after metadata reserve: {device_budget}")
+        if total_parts_bytes > device_budget:
+            usage_details = ", ".join(
+                f"{group}={size}" for group, size in sorted(group_usage.items())
             )
             raise RuntimeError(
-                "Rebuilt dynamic partitions exceed the safe joyeuse super-group budget "
-                f"({total_parts_bytes} > {group_max} bytes); refusing to exceed the device cap. "
-                f"Rebuilt images: {partition_sizes}"
+                "Rebuilt dynamic partitions exceed the safe joyeuse super-device budget "
+                f"({total_parts_bytes} > {device_budget} bytes); refusing to exceed the device cap. "
+                f"Payload by group: {usage_details}"
             )
-        geom.groups[primary_group] = group_max
+
+        source_groups = dict(geom.groups)
+        geom.groups = calculate_safe_group_caps(geom, group_usage)
+        if not geom.is_ab:
+            expanded_groups = {
+                group: (source_groups.get(group, 0), cap)
+                for group, cap in geom.groups.items()
+                if cap > source_groups.get(group, 0)
+            }
+            omitted_groups = sorted(set(source_groups) - set(geom.groups))
+            print(
+                f"[LP metadata] Recalculated non-slot-suffixed group limits from rebuilt usage: "
+                f"caps={geom.groups}, expanded={expanded_groups}, omitted_empty={omitted_groups}, "
+                f"payload={total_parts_bytes}, safe_device_budget={device_budget} bytes"
+            )
+        print(f"[LP metadata] Rebuilt payload by group: {dict(sorted(group_usage.items()))}")
 
         raw_or_sparse_super = rebuilt_dir / "super_repacked.img"
         lp_cmd = [
@@ -1235,27 +1387,41 @@ def repack_rom_workspace(
             "--metadata-slots",
             str(geom.metadata_slots),
         ]
-        if geom.is_ab:
+        if geom.virtual_ab:
             lp_cmd.append("--virtual-ab")
         if geom.was_sparse or geom.was_brotli_dat:
             lp_cmd.append("--sparse")
 
-        for g_name, g_max in geom.groups.items():
-            if geom.is_ab and not g_name.endswith("_a") and not g_name.endswith("_b"):
-                lp_cmd.extend(["--group", f"{g_name}_a:{g_max}", "--group", f"{g_name}_b:{g_max}"])
-            else:
-                lp_cmd.extend(["--group", f"{g_name}:{g_max}"])
+        if geom.is_ab:
+            output_group_caps: Dict[str, int] = {}
+            group_bases = {
+                name[:-2] if name.endswith(("_a", "_b")) else name
+                for name in geom.groups
+            }
+            for group_base in sorted(group_bases):
+                for suffix in ("_a", "_b"):
+                    output_name = f"{group_base}{suffix}"
+                    output_group_caps[output_name] = geom.groups.get(
+                        output_name,
+                        geom.groups.get(group_base, next(iter(geom.groups.values()), device_budget)),
+                    )
+        else:
+            output_group_caps = dict(geom.groups)
+
+        for g_name, g_max in output_group_caps.items():
+            lp_cmd.extend(["--group", f"{g_name}:{g_max}"])
 
         for base, img_path in rebuilt_imgs.items():
             pname = f"{base}{geom.slot_suffix}"
-            grp = geom.part_to_group.get(pname, f"{primary_group}{geom.slot_suffix}" if geom.slot_suffix and not primary_group.endswith(geom.slot_suffix) else primary_group)
+            grp = rebuilt_group_map[base]
             sz = img_path.stat().st_size
             lp_cmd.extend(["--partition", f"{pname}:readonly:{sz}:{grp}", "--image", f"{pname}={img_path}"])
             if geom.is_ab and geom.slot_suffix == "_a":
-                b_grp = grp[:-2] + "_b" if grp.endswith("_a") else grp
+                b_grp = _slot_group_name(grp, "_b")
                 lp_cmd.extend(["--partition", f"{base}_b:readonly:0:{b_grp}"])
 
-        for stem, (img_path, grp) in ws.unmodified_super_imgs.items():
+        for stem, (img_path, _source_group) in ws.unmodified_super_imgs.items():
+            grp = unmodified_group_map[stem]
             sz = img_path.stat().st_size
             lp_cmd.extend(["--partition", f"{stem}:readonly:{sz}:{grp}", "--image", f"{stem}={img_path}"])
 
@@ -1279,6 +1445,11 @@ def repack_rom_workspace(
             raise RuntimeError(
                 "Rebuilt super metadata-slot count changed unexpectedly: "
                 f"{verified_geom.metadata_slots} != {geom.metadata_slots}"
+            )
+        if verified_geom.virtual_ab != geom.virtual_ab:
+            raise RuntimeError(
+                "Rebuilt super Virtual A/B flag changed unexpectedly: "
+                f"{verified_geom.virtual_ab} != {geom.virtual_ab}"
             )
 
         for p in rebuilt_imgs.values():

@@ -47,13 +47,14 @@ from rom_container import (
     MAX_SUPER_DEVICE_SIZE_BYTES,
     SPARSE_MAGIC,
     SuperGeometry,
-    compact_ext4_image,
+    calculate_safe_group_caps,
     detect_fs_type,
     erofs_uses_non_lz4_compression,
     escape_fc_regex,
+    ext4_target_block_count,
     find_host_tool,
     parse_super_geometry,
-    safe_primary_group_budget,
+    read_ext4_block_usage,
     sdat2img,
     sparse_img_to_sdat,
     sync_fs_config_and_contexts,
@@ -66,10 +67,15 @@ from upload_release import (
 )
 
 
-def _write_test_super_image(path: Path, device_size: int = 0, virtual_ab: bool = False) -> None:
+def _write_test_super_image(
+    path: Path,
+    device_size: int = 0,
+    virtual_ab: bool = False,
+    metadata_slots: int = 2,
+    slot_suffixed: bool = False,
+) -> None:
     """Create an AOSP LP v1.2 image fixture with valid geometry/header/table checksums."""
     metadata_max_size = 4096
-    metadata_slots = 2
     device_size = device_size or (MAX_SUPER_DEVICE_SIZE_BYTES + 512 * 100)
 
     geometry = bytearray(
@@ -85,11 +91,11 @@ def _write_test_super_image(path: Path, device_size: int = 0, virtual_ab: bool =
     )
     geometry[8:40] = hashlib.sha256(geometry).digest()
 
-    partition = struct.pack("<36sIIII", b"system", 0, 0, 1, 1)
+    partition = struct.pack("<36sIIII", b"system", 1 << 1 if slot_suffixed else 0, 0, 1, 1)
     extent = struct.pack("<QIQI", 2048, 0, 100000, 0)
     default_group = struct.pack("<36sIQ", b"default", 0, 0)
-    dynamic_group = struct.pack("<36sIQ", b"qti_dynamic_partitions", 0, device_size)
-    block_device = struct.pack("<QIIQ36sI", 100000, 1048576, 0, device_size, b"super", 0)
+    dynamic_group = struct.pack("<36sIQ", b"qti_dynamic_partitions", 1 if slot_suffixed else 0, device_size)
+    block_device = struct.pack("<QIIQ36sI", 100000, 1048576, 0, device_size, b"super", 1 if slot_suffixed else 0)
     tables = partition + extent + default_group + dynamic_group + block_device
 
     header_size = 256
@@ -222,17 +228,25 @@ class TestRollercoasterPipeline(unittest.TestCase):
             (part_dir / "bin").mkdir(parents=True)
             (part_dir / "lost+found").mkdir()
             (part_dir / "bin" / "helper.sh").write_text("#!/system/bin/sh\n", encoding="utf-8")
+            (part_dir / "bin" / "toybox").write_bytes(b"toybox-bin")
+            (part_dir / "bin" / "ls").symlink_to("toybox")
             (part_dir / "priv-app" / "RollercoasterSupport").mkdir(parents=True)
             (part_dir / "priv-app" / "RollercoasterSupport" / "RollercoasterSupport.apk").write_bytes(b"PK\x03\x04")
 
             fsc = tdir / "product_fs_config"
             fc = tdir / "product_file_contexts"
-            fsc.write_text("/ 0 0 0755\nproduct 0 0 0755\n", encoding="utf-8")
+            fsc.write_text(
+                "/ 0 0 0755\nproduct 0 0 0755\nproduct/bin/ls 0 2000 0777 toybox\n",
+                encoding="utf-8",
+            )
             fc.write_text("/ u:object_r:system_file:s0\n/product(/.*)? u:object_r:system_file:s0\n", encoding="utf-8")
 
             sync_fs_config_and_contexts("product", part_dir, fsc, fc)
-            self.assertIn("product/bin/helper.sh 0 2000 0755", fsc.read_text(encoding="utf-8"))
-            self.assertIn("product/lost+found 0 0 0700", fsc.read_text(encoding="utf-8"))
+            fs_config_text = fsc.read_text(encoding="utf-8")
+            self.assertIn("product/bin/helper.sh 0 2000 0755", fs_config_text)
+            self.assertIn("product/bin/ls 0 2000 0777", fs_config_text)
+            self.assertNotIn("product/bin/ls 0 2000 0777 toybox", fs_config_text)
+            self.assertIn("product/lost+found 0 0 0700", fs_config_text)
             self.assertIn(r"/product/priv-app/RollercoasterSupport/RollercoasterSupport\.apk u:object_r:system_file:s0", fc.read_text(encoding="utf-8"))
 
     def test_05_vbmeta_patcher(self) -> None:
@@ -429,8 +443,18 @@ class TestRollercoasterPipeline(unittest.TestCase):
             self.assertEqual(geometry.part_to_group["system"], "qti_dynamic_partitions")
 
             virtual_ab_super = Path(td) / "super_virtual_ab.img"
-            _write_test_super_image(virtual_ab_super, virtual_ab=True)
-            self.assertTrue(parse_super_geometry(virtual_ab_super).is_ab)
+            _write_test_super_image(virtual_ab_super, virtual_ab=True, metadata_slots=3)
+            virtual_geometry = parse_super_geometry(virtual_ab_super)
+            self.assertTrue(virtual_geometry.virtual_ab)
+            self.assertFalse(virtual_geometry.is_ab)
+            self.assertEqual(virtual_geometry.metadata_slots, 3)
+
+            slot_suffixed_super = Path(td) / "super_slot_suffixed.img"
+            _write_test_super_image(slot_suffixed_super, slot_suffixed=True)
+            slot_geometry = parse_super_geometry(slot_suffixed_super)
+            self.assertTrue(slot_geometry.is_ab)
+            self.assertFalse(slot_geometry.virtual_ab)
+            self.assertEqual(slot_geometry.part_to_group["system_a"], "qti_dynamic_partitions_a")
 
     def test_11_split_camera_apk_and_device_integration(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -872,77 +896,119 @@ else:
             with self.assertRaisesRegex(RuntimeError, "Invalid LP metadata"):
                 parse_super_geometry(raw_super)
 
-    def test_18_ext4_minimum_size_and_safe_dynamic_group_budget(self) -> None:
+    def test_18_measured_ext4_rebuild_and_safe_dynamic_group_budget(self) -> None:
         device_budget = MAX_SUPER_DEVICE_SIZE_BYTES - 4 * 1024 * 1024
         original_group_limit = 8 * 1024 * 1024 * 1024
         single_group = SuperGeometry(
             dev_size=MAX_SUPER_DEVICE_SIZE_BYTES,
             groups={"qti_dynamic_partitions": original_group_limit},
         )
-        self.assertEqual(
-            safe_primary_group_budget(single_group, "qti_dynamic_partitions", original_group_limit - 1),
-            original_group_limit,
+        near_device_usage = device_budget - 1 * 1024 * 1024
+        single_caps = calculate_safe_group_caps(
+            single_group,
+            {"qti_dynamic_partitions": near_device_usage},
         )
-        self.assertEqual(
-            safe_primary_group_budget(single_group, "qti_dynamic_partitions", original_group_limit + 1),
-            device_budget,
-        )
+        self.assertEqual(single_caps["qti_dynamic_partitions"], device_budget)
+        self.assertLessEqual(sum(single_caps.values()), device_budget)
+        with self.assertRaisesRegex(RuntimeError, "super-device budget"):
+            calculate_safe_group_caps(
+                single_group,
+                {"qti_dynamic_partitions": device_budget + 1},
+            )
+
         multi_group = SuperGeometry(
             dev_size=MAX_SUPER_DEVICE_SIZE_BYTES,
-            groups={"qti_dynamic_partitions": original_group_limit, "reserved_group": 128 * 1024 * 1024},
+            groups={
+                "qti_dynamic_partitions": original_group_limit,
+                "reserved_group": 128 * 1024 * 1024,
+                "unused_group": 64 * 1024 * 1024,
+            },
         )
-        self.assertEqual(
-            safe_primary_group_budget(multi_group, "qti_dynamic_partitions", original_group_limit + 1),
-            original_group_limit,
+        multi_caps = calculate_safe_group_caps(
+            multi_group,
+            {"qti_dynamic_partitions": 3 * 1024**3, "reserved_group": 2 * 1024**3},
         )
-        ab_group = SuperGeometry(
+        self.assertNotIn("unused_group", multi_caps)
+        self.assertLessEqual(sum(multi_caps.values()), device_budget)
+        self.assertEqual(sum(multi_caps.values()), device_budget)
+
+        default_group_caps = calculate_safe_group_caps(
+            single_group,
+            {"default": 128 * 1024**2, "qti_dynamic_partitions": device_budget - 256 * 1024**2},
+        )
+        self.assertLessEqual(
+            sum(default_group_caps.values()) + 128 * 1024**2,
+            device_budget,
+        )
+
+        slot_group = SuperGeometry(
             dev_size=MAX_SUPER_DEVICE_SIZE_BYTES,
             is_ab=True,
+            slot_suffix="_a",
             groups={"qti_dynamic_partitions": original_group_limit},
         )
         self.assertEqual(
-            safe_primary_group_budget(ab_group, "qti_dynamic_partitions", original_group_limit + 1),
-            original_group_limit,
+            calculate_safe_group_caps(slot_group, {"qti_dynamic_partitions_a": original_group_limit}),
+            slot_group.groups,
         )
+        with self.assertRaisesRegex(RuntimeError, "preserved source limit"):
+            calculate_safe_group_caps(
+                slot_group,
+                {"qti_dynamic_partitions_a": original_group_limit + 1},
+            )
+        self.assertEqual(ext4_target_block_count(1000), 1512)
+        self.assertEqual(ext4_target_block_count(1_000_000), 1_001_000)
 
         mke2fs = find_host_tool("mke2fs")
-        resize2fs = find_host_tool("resize2fs")
         e2fsck = find_host_tool("e2fsck")
-        if mke2fs is None or resize2fs is None or e2fsck is None:
+        if mke2fs is None or e2fsck is None:
             self.skipTest("e2fsprogs is not installed on this test host")
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             tree = root / "tree"
             tree.mkdir()
             (tree / "payload.bin").write_bytes(os.urandom(4 * 1024 * 1024))
-            image = root / "system.img"
-            subprocess.run(
-                [
-                    str(mke2fs),
-                    "-F",
-                    "-O",
-                    "^has_journal",
-                    "-m",
-                    "0",
-                    "-L",
-                    "system",
-                    "-t",
-                    "ext4",
-                    "-b",
-                    "4096",
-                    "-d",
-                    str(tree),
-                    str(image),
-                    str(32 * 1024),
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            original_size = image.stat().st_size
-            compact_ext4_image(image, resize2fs, e2fsck)
-            self.assertLess(image.stat().st_size, original_size)
-            self.assertEqual(detect_fs_type(image), "ext4")
+            stage = root / "stage.img"
+            tight = root / "tight.img"
+
+            def make_image(path: Path, blocks: int) -> None:
+                subprocess.run(
+                    [
+                        str(mke2fs),
+                        "-F",
+                        "-O",
+                        "^has_journal",
+                        "-m",
+                        "0",
+                        "-L",
+                        "system",
+                        "-t",
+                        "ext4",
+                        "-b",
+                        "4096",
+                        "-d",
+                        str(tree),
+                        str(path),
+                        str(blocks),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+            make_image(stage, 32 * 1024)
+            stage_total, stage_free, block_size = read_ext4_block_usage(stage)
+            self.assertEqual(block_size, 4096)
+            target_blocks = ext4_target_block_count(stage_total - stage_free)
+            self.assertLess(target_blocks, stage_total)
+            make_image(tight, target_blocks)
+            final_total, final_free, final_block_size = read_ext4_block_usage(tight)
+            self.assertEqual(final_total, target_blocks)
+            self.assertEqual(final_block_size, 4096)
+            self.assertGreaterEqual(final_free, 256)
+            self.assertLess(tight.stat().st_size, stage.stat().st_size)
+            self.assertEqual(detect_fs_type(tight), "ext4")
+            subprocess.run([str(e2fsck), "-f", "-n", str(tight)], check=True, capture_output=True, text=True)
 
 
 if __name__ == "__main__":

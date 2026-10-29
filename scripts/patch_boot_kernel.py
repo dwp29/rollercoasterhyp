@@ -174,6 +174,10 @@ def patch_boot_image(
         or any(token.startswith("selinux=") or token == "enforcing=0" for token in verified_cmdline)
     ):
         raise RuntimeError("Round-trip verification failed: boot cmdline is not explicitly SELinux enforcing")
+    print(
+        "[boot-patcher] Verified repacked boot header: SELinux enforcing; "
+        "permissive/disable cmdline tokens absent"
+    )
 
     out_boot_img.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(repacked, out_boot_img)

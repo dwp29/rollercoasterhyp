@@ -2100,10 +2100,10 @@ def main() -> None:
     if ws.container_type == "super":
         if ws.super_geom is None:
             raise RuntimeError("LP metadata parser did not produce super geometry; refusing to build an unchecked super image")
-        if ws.super_geom.is_ab:
+        if ws.super_geom.is_ab or ws.super_geom.virtual_ab:
             raise RuntimeError(
-                "The selected base ROM uses an A/B dynamic-partition layout. joyeuse is built as A-only; "
-                "refusing to repack or flash an incompatible super image."
+                "The selected base ROM uses an A/B or Virtual A/B dynamic-partition layout. "
+                "joyeuse is built as A-only; refusing to repack or flash an incompatible super image."
             )
     required_partitions = ("system", "product", "system_ext", "vendor")
     missing_partitions = [name for name in required_partitions if name not in ws.partitions]
