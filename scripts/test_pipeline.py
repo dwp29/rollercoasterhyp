@@ -46,10 +46,14 @@ from rom_container import (
     EXT4_MAGIC,
     MAX_SUPER_DEVICE_SIZE_BYTES,
     SPARSE_MAGIC,
+    SuperGeometry,
+    compact_ext4_image,
     detect_fs_type,
     erofs_uses_non_lz4_compression,
     escape_fc_regex,
+    find_host_tool,
     parse_super_geometry,
+    safe_primary_group_budget,
     sdat2img,
     sparse_img_to_sdat,
     sync_fs_config_and_contexts,
@@ -216,6 +220,7 @@ class TestRollercoasterPipeline(unittest.TestCase):
             tdir = Path(td)
             part_dir = tdir / "product"
             (part_dir / "bin").mkdir(parents=True)
+            (part_dir / "lost+found").mkdir()
             (part_dir / "bin" / "helper.sh").write_text("#!/system/bin/sh\n", encoding="utf-8")
             (part_dir / "priv-app" / "RollercoasterSupport").mkdir(parents=True)
             (part_dir / "priv-app" / "RollercoasterSupport" / "RollercoasterSupport.apk").write_bytes(b"PK\x03\x04")
@@ -227,6 +232,7 @@ class TestRollercoasterPipeline(unittest.TestCase):
 
             sync_fs_config_and_contexts("product", part_dir, fsc, fc)
             self.assertIn("product/bin/helper.sh 0 2000 0755", fsc.read_text(encoding="utf-8"))
+            self.assertIn("product/lost+found 0 0 0700", fsc.read_text(encoding="utf-8"))
             self.assertIn(r"/product/priv-app/RollercoasterSupport/RollercoasterSupport\.apk u:object_r:system_file:s0", fc.read_text(encoding="utf-8"))
 
     def test_05_vbmeta_patcher(self) -> None:
@@ -865,6 +871,78 @@ else:
                 image.write(bytes([byte[0] ^ 1]))
             with self.assertRaisesRegex(RuntimeError, "Invalid LP metadata"):
                 parse_super_geometry(raw_super)
+
+    def test_18_ext4_minimum_size_and_safe_dynamic_group_budget(self) -> None:
+        device_budget = MAX_SUPER_DEVICE_SIZE_BYTES - 4 * 1024 * 1024
+        original_group_limit = 8 * 1024 * 1024 * 1024
+        single_group = SuperGeometry(
+            dev_size=MAX_SUPER_DEVICE_SIZE_BYTES,
+            groups={"qti_dynamic_partitions": original_group_limit},
+        )
+        self.assertEqual(
+            safe_primary_group_budget(single_group, "qti_dynamic_partitions", original_group_limit - 1),
+            original_group_limit,
+        )
+        self.assertEqual(
+            safe_primary_group_budget(single_group, "qti_dynamic_partitions", original_group_limit + 1),
+            device_budget,
+        )
+        multi_group = SuperGeometry(
+            dev_size=MAX_SUPER_DEVICE_SIZE_BYTES,
+            groups={"qti_dynamic_partitions": original_group_limit, "reserved_group": 128 * 1024 * 1024},
+        )
+        self.assertEqual(
+            safe_primary_group_budget(multi_group, "qti_dynamic_partitions", original_group_limit + 1),
+            original_group_limit,
+        )
+        ab_group = SuperGeometry(
+            dev_size=MAX_SUPER_DEVICE_SIZE_BYTES,
+            is_ab=True,
+            groups={"qti_dynamic_partitions": original_group_limit},
+        )
+        self.assertEqual(
+            safe_primary_group_budget(ab_group, "qti_dynamic_partitions", original_group_limit + 1),
+            original_group_limit,
+        )
+
+        mke2fs = find_host_tool("mke2fs")
+        resize2fs = find_host_tool("resize2fs")
+        e2fsck = find_host_tool("e2fsck")
+        if mke2fs is None or resize2fs is None or e2fsck is None:
+            self.skipTest("e2fsprogs is not installed on this test host")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tree = root / "tree"
+            tree.mkdir()
+            (tree / "payload.bin").write_bytes(os.urandom(4 * 1024 * 1024))
+            image = root / "system.img"
+            subprocess.run(
+                [
+                    str(mke2fs),
+                    "-F",
+                    "-O",
+                    "^has_journal",
+                    "-m",
+                    "0",
+                    "-L",
+                    "system",
+                    "-t",
+                    "ext4",
+                    "-b",
+                    "4096",
+                    "-d",
+                    str(tree),
+                    str(image),
+                    str(32 * 1024),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            original_size = image.stat().st_size
+            compact_ext4_image(image, resize2fs, e2fsck)
+            self.assertLess(image.stat().st_size, original_size)
+            self.assertEqual(detect_fs_type(image), "ext4")
 
 
 if __name__ == "__main__":

@@ -14,7 +14,8 @@ Key guarantee for Rollercoaster-Roll.3.3 (`4.14.370`):
     `mkfs.erofs -zlz4hc,9` (high-compression LZ4HC, 100% kernel-compatible, zero bootloops!).
   - Extracted EROFS trees have read-only 0444/0555 modes normalized via `make_tree_writable`
     so downstream modding & cleanup never fail with PermissionError.
-  - `SuperGeometry` clamps dynamic group max_size to `dev_size - 4 MiB` so `lpmake` never overflows.
+  - `SuperGeometry` keeps dynamic groups within the device cap, compacting ext4 images and
+    only expanding a single non-A/B group into otherwise unused super space when necessary.
 """
 
 from __future__ import annotations
@@ -87,6 +88,48 @@ def run_cmd(cmd: List[str], cwd: Optional[Path] = None, env_extra: Optional[Dict
         env = os.environ.copy()
         env.update(env_extra)
     return subprocess.run(cmd, cwd=str(cwd) if cwd else None, env=env, check=True)
+
+
+def find_host_tool(name: str) -> Optional[Path]:
+    """Locate a host utility even when /usr/sbin is missing from PATH."""
+    found = shutil.which(name)
+    if found:
+        return Path(found)
+    for directory in ("/usr/sbin", "/sbin", "/usr/bin", "/bin"):
+        candidate = Path(directory) / name
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def compact_ext4_image(
+    image_path: Path,
+    resize2fs_bin: Optional[Path] = None,
+    e2fsck_bin: Optional[Path] = None,
+) -> Path:
+    """Shrink a freshly built read-only ext4 partition to its minimum valid size."""
+    resize2fs = resize2fs_bin or find_host_tool("resize2fs")
+    e2fsck = e2fsck_bin or find_host_tool("e2fsck")
+    if resize2fs is None or e2fsck is None:
+        missing = [name for name, path in (("resize2fs", resize2fs), ("e2fsck", e2fsck)) if path is None]
+        raise RuntimeError(f"Required e2fsprogs utilities are unavailable for safe ext4 compaction: {missing}")
+    if not image_path.is_file() or image_path.stat().st_size == 0:
+        raise RuntimeError(f"Cannot compact missing or empty ext4 image: {image_path}")
+
+    original_size = image_path.stat().st_size
+    run_cmd([str(resize2fs), "-M", str(image_path)])
+    compacted_size = image_path.stat().st_size
+    if compacted_size <= 0 or compacted_size > original_size or compacted_size % 4096:
+        raise RuntimeError(
+            f"resize2fs produced an invalid compacted image size for {image_path.name}: "
+            f"{compacted_size} bytes (original {original_size})"
+        )
+    run_cmd([str(e2fsck), "-f", "-n", str(image_path)])
+    print(
+        f"[repack-fs] Compacted {image_path.name}: "
+        f"{original_size / (1024**2):.1f} -> {compacted_size / (1024**2):.1f} MiB"
+    )
+    return image_path
 
 
 def make_tree_writable(root: Path) -> None:
@@ -640,6 +683,24 @@ def parse_super_geometry(super_image: Path) -> SuperGeometry:
         reader.close()
 
 
+def safe_primary_group_budget(geom: SuperGeometry, primary_group: str, required_bytes: int) -> int:
+    """Return a safe LP group cap, using free device space only for a single non-A/B group."""
+    if primary_group not in geom.groups:
+        raise RuntimeError(f"Primary dynamic group is missing from LP metadata: {primary_group}")
+    device_budget = min(geom.dev_size, MAX_SUPER_DEVICE_SIZE_BYTES) - SUPER_METADATA_RESERVE_BYTES
+    if device_budget <= 0:
+        raise RuntimeError(f"Invalid dynamic-partition capacity after metadata reserve: {device_budget}")
+
+    source_group_budget = min(geom.groups[primary_group], device_budget)
+    if (
+        required_bytes > source_group_budget
+        and not geom.is_ab
+        and len(geom.groups) == 1
+    ):
+        return device_budget
+    return source_group_budget
+
+
 def escape_fc_regex(path_str: str) -> str:
     return re.sub(r"([.+*()\[\]^$?\\{}|])", r"\\\1", path_str)
 
@@ -719,7 +780,8 @@ def sync_fs_config_and_contexts(
                     new_fsc_lines.append(f"{fsc_key} 0 0 0777 {target}")
                 elif is_dir:
                     gid = 2000 if ("/bin" in f"/{fsc_key}" or fsc_key.endswith("/bin")) else 0
-                    new_fsc_lines.append(f"{fsc_key} 0 {gid} 0755")
+                    mode = "0700" if fsc_key == f"{part_name}/lost+found" else "0755"
+                    new_fsc_lines.append(f"{fsc_key} 0 {gid} {mode}")
                 else:
                     is_exec = (
                         "/bin/" in f"/{fsc_key}"
@@ -814,7 +876,16 @@ def rebuild_partition_img(
     out_raw_img: Path,
     mkfs_erofs_bin: Path,
     timestamp: str = "1735689600",
+    mke2fs_bin: Optional[Path] = None,
+    e2fsdroid_bin: Optional[Path] = None,
 ) -> Path:
+    if rec.fs_type == "ext4":
+        lost_found = rec.extract_dir / "lost+found"
+        if lost_found.is_symlink() or (lost_found.exists() and not lost_found.is_dir()):
+            raise RuntimeError(f"Invalid ext4 lost+found entry in {rec.base_name}: {lost_found}")
+        if not lost_found.exists():
+            lost_found.mkdir()
+            os.chmod(lost_found, 0o700)
     sync_fs_config_and_contexts(
         part_name=rec.base_name,
         extract_dir=rec.extract_dir,
@@ -845,30 +916,46 @@ def rebuild_partition_img(
         img_bytes = max(int(tree_bytes * 1.16) + 64 * 1024 * 1024, 128 * 1024 * 1024)
         img_bytes = ((img_bytes + 4095) // 4096) * 4096
         blocks_4k = img_bytes // 4096
-        mke2fs_bin = shutil.which("mke2fs") or "/sbin/mke2fs"
-        e2fsdroid_bin = shutil.which("e2fsdroid")
-        if e2fsdroid_bin:
-            run_cmd([mke2fs_bin, "-O", "^has_journal", "-L", rec.base_name, "-t", "ext4", "-b", "4096", str(out_raw_img), str(blocks_4k)])
-            run_cmd(
-                [
-                    e2fsdroid_bin,
-                    "-e",
-                    "-T",
-                    timestamp,
-                    "-C",
-                    str(rec.fs_config_path),
-                    "-S",
-                    str(rec.file_contexts_path),
-                    "-f",
-                    str(rec.extract_dir),
-                    "-a",
-                    f"/{rec.base_name}",
-                    str(out_raw_img),
-                ]
-            )
-        else:
-            run_cmd(["truncate", "-s", str(img_bytes), str(out_raw_img)])
-            run_cmd([mke2fs_bin, "-F", "-O", "^has_journal", "-L", rec.base_name, "-t", "ext4", "-b", "4096", "-d", str(rec.extract_dir), str(out_raw_img)])
+        mke2fs = mke2fs_bin or find_host_tool("mke2fs")
+        e2fsdroid = e2fsdroid_bin or find_host_tool("e2fsdroid")
+        if mke2fs is None or e2fsdroid is None:
+            missing = [name for name, path in (("mke2fs", mke2fs), ("e2fsdroid", e2fsdroid)) if path is None]
+            raise RuntimeError(f"Required ext4 image tools are unavailable: {missing}")
+        run_cmd(
+            [
+                str(mke2fs),
+                "-O",
+                "^has_journal",
+                "-m",
+                "0",
+                "-L",
+                rec.base_name,
+                "-t",
+                "ext4",
+                "-b",
+                "4096",
+                str(out_raw_img),
+                str(blocks_4k),
+            ]
+        )
+        run_cmd(
+            [
+                str(e2fsdroid),
+                "-e",
+                "-T",
+                timestamp,
+                "-C",
+                str(rec.fs_config_path),
+                "-S",
+                str(rec.file_contexts_path),
+                "-f",
+                str(rec.extract_dir),
+                "-a",
+                f"/{rec.base_name}",
+                str(out_raw_img),
+            ]
+        )
+        compact_ext4_image(out_raw_img)
     else:
         raise RuntimeError(f"Unsupported fs_type {rec.fs_type}")
 
@@ -1100,7 +1187,13 @@ def repack_rom_workspace(
     rebuilt_imgs: Dict[str, Path] = {}
     for base, rec in ws.partitions.items():
         out_img = rebuilt_dir / f"{rec.raw_name}.img"
-        rebuild_partition_img(rec, out_img, tools["mkfs.erofs"])
+        rebuild_partition_img(
+            rec,
+            out_img,
+            tools["mkfs.erofs"],
+            mke2fs_bin=tools.get("mke2fs"),
+            e2fsdroid_bin=tools.get("e2fsdroid"),
+        )
         shutil.rmtree(rec.extract_dir.parent, ignore_errors=True)
         rebuilt_imgs[base] = out_img
 
@@ -1114,15 +1207,21 @@ def repack_rom_workspace(
         total_parts_bytes = sum(p.stat().st_size for p in rebuilt_imgs.values()) + sum(
             p.stat().st_size for p, _ in ws.unmodified_super_imgs.values()
         )
-        group_max = min(
-            geom.groups[primary_group],
-            geom.dev_size - SUPER_METADATA_RESERVE_BYTES,
-            MAX_SUPER_DEVICE_SIZE_BYTES - SUPER_METADATA_RESERVE_BYTES,
-        )
+        source_group_max = geom.groups[primary_group]
+        group_max = safe_primary_group_budget(geom, primary_group, total_parts_bytes)
+        if group_max > source_group_max:
+            print(
+                f"[LP metadata] Expanded the only non-A/B dynamic group {primary_group} "
+                f"from {source_group_max} to {group_max} bytes, within the joyeuse super-device cap"
+            )
         if total_parts_bytes > group_max:
+            partition_sizes = ", ".join(
+                f"{name}={path.stat().st_size}" for name, path in sorted(rebuilt_imgs.items())
+            )
             raise RuntimeError(
                 "Rebuilt dynamic partitions exceed the safe joyeuse super-group budget "
-                f"({total_parts_bytes} > {group_max} bytes); refusing to enlarge super.img"
+                f"({total_parts_bytes} > {group_max} bytes); refusing to exceed the device cap. "
+                f"Rebuilt images: {partition_sizes}"
             )
         geom.groups[primary_group] = group_max
 

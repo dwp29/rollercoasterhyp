@@ -1836,7 +1836,7 @@ def prepare_port_tools(
         bin_dir = candidates[0].parent if candidates else Path("/usr/bin")
 
     tools: Dict[str, Any] = {"port_tools_dir": tdir}
-    for name in ("magiskboot", "mkfs.erofs", "extract.erofs", "lpunpack"):
+    for name in ("magiskboot", "mkfs.erofs", "extract.erofs", "lpunpack", "mke2fs", "e2fsdroid"):
         candidate = bin_dir / name
         if candidate.is_file():
             candidate.chmod(0o755)
@@ -1899,6 +1899,8 @@ def prepare_port_tools(
         "mkfs.erofs",
         "extract.erofs",
         "lpunpack",
+        "mke2fs",
+        "e2fsdroid",
         "lpmake",
         "props_hook_zip",
         "apkeditor_jar",
