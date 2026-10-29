@@ -279,6 +279,17 @@ def fetch_github_file(
     return destination
 
 
+def validate_arm32_shared_library(library_path: Path) -> None:
+    """Reject spatializer blobs that are not 32-bit little-endian ARM shared objects."""
+    if not library_path.is_file() or library_path.stat().st_size < 20:
+        raise RuntimeError(f"Required ARM32 spatializer library is missing or truncated: {library_path}")
+    header = library_path.read_bytes()[:20]
+    elf_type = int.from_bytes(header[16:18], "little")
+    machine = int.from_bytes(header[18:20], "little")
+    if header[:4] != b"\x7fELF" or header[4] != 1 or header[5] != 1 or elf_type != 3 or machine != 40:
+        raise RuntimeError(f"Spatializer library is not an ELF32 ARM shared object: {library_path}")
+
+
 def validate_apk_file(apk_path: Path) -> None:
     if not apk_path.is_file() or apk_path.stat().st_size == 0:
         raise RuntimeError(f"Required APK is missing or empty: {apk_path}")
@@ -1337,6 +1348,8 @@ def integrate_cruecy_dolby_and_spatial(
     system_ext_dir: Path,
     custom_dax_apk: Path,
     cruecy_audio_effects_xml: Path,
+    spatializer_library: Path,
+    spatializer_auxiliary_library: Path,
     runtime_policy_rule: Path,
     partition_file_contexts_path: Path,
     system_dir: Optional[Path] = None,
@@ -1359,10 +1372,22 @@ def integrate_cruecy_dolby_and_spatial(
             copied += 1
 
     merge_dolby_selinux_contexts(dolby_repo, vendor_dir, partition_file_contexts_path)
+    validate_arm32_shared_library(spatializer_library)
+    validate_arm32_shared_library(spatializer_auxiliary_library)
+    spatializer_destinations = (
+        (spatializer_library, vendor_dir / "lib" / "soundfx" / "libspatialaudio.so"),
+        (spatializer_auxiliary_library, vendor_dir / "lib" / "aoc_audio_stereo_spatializer.so"),
+    )
+    for source, destination in spatializer_destinations:
+        safe_copy(source, destination)
+        copied += 1
+
     required_blob_relpaths = (
         "lib64/soundfx/libswdap.so",
         "lib64/soundfx/libdlbvol.so",
         "lib64/soundfx/libswgamedap.so",
+        "lib/soundfx/libspatialaudio.so",
+        "lib/aoc_audio_stereo_spatializer.so",
         "bin/hw/vendor.dolby.hardware.dms@2.0-service",
     )
     missing_blobs = [rel for rel in required_blob_relpaths if not (vendor_dir / rel).is_file()]
@@ -1446,7 +1471,15 @@ def integrate_cruecy_dolby_and_spatial(
     print(f"[dolby] Integrated {copied} vendor blobs, Cruecy effects XML, codec registration, and Indonesian DAX UI")
     return {
         "vendor_blob_count": copied,
+        "dolby_source_blob_count": copied - len(spatializer_destinations),
         "required_blobs": list(required_blob_relpaths),
+        "spatializer_libraries": [
+            {
+                "path": str(destination.relative_to(vendor_dir)),
+                "sha256": sha256_file(destination),
+            }
+            for _, destination in spatializer_destinations
+        ],
         "selinux_policy_validation": selinux_policy_validation,
         "audio_effects_paths": [str(path.relative_to(vendor_dir)) for path in existing_audio_effects],
         "audio_effects_source_sha256": sha256_file(cruecy_audio_effects_xml),
@@ -1897,6 +1930,8 @@ def main() -> None:
         "base_rom_sha256",
         "kernel_zip_sha256",
         "cruecy_audio_effects_sha256",
+        "spatializer_library_sha256",
+        "spatializer_auxiliary_sha256",
         "ksu_manager_sha256",
         "heliboard_sha256",
         "play_integrity_fork_sha256",
@@ -1914,6 +1949,7 @@ def main() -> None:
         "miuicamera_vendor_commit",
         "miuicamera_device_commit",
         "hyperos_port_tools_commit",
+        "spatializer_vendor_commit",
     ):
         if not re.fullmatch(r"[0-9a-fA-F]{40}", str(src_cfg.get(key, ""))):
             raise RuntimeError(f"Configuration is missing an immutable commit pin: sources.{key}")
@@ -2002,6 +2038,20 @@ def main() -> None:
         src_cfg["cruecy_audio_effects_commit"],
         gen_dir / "cruecy_audio_effects.xml",
         src_cfg["cruecy_audio_effects_sha256"],
+    )
+    spatializer_library = fetch_github_file(
+        src_cfg["spatializer_vendor_repo"],
+        src_cfg["spatializer_library_repo_path"],
+        src_cfg["spatializer_vendor_commit"],
+        gen_dir / "spatializer" / "libspatialaudio.so",
+        src_cfg["spatializer_library_sha256"],
+    )
+    spatializer_auxiliary_library = fetch_github_file(
+        src_cfg["spatializer_vendor_repo"],
+        src_cfg["spatializer_auxiliary_repo_path"],
+        src_cfg["spatializer_vendor_commit"],
+        gen_dir / "spatializer" / "aoc_audio_stereo_spatializer.so",
+        src_cfg["spatializer_auxiliary_sha256"],
     )
 
     bootanim_zip = generate_bootanimation(gen_dir / src_cfg["bootanimation_zip_name"])
@@ -2170,6 +2220,8 @@ def main() -> None:
         system_ext_dir=se_dir,
         custom_dax_apk=dax_apk,
         cruecy_audio_effects_xml=audio_effects_source,
+        spatializer_library=spatializer_library,
+        spatializer_auxiliary_library=spatializer_auxiliary_library,
         runtime_policy_rule=core_src / "sepolicy.rule",
         partition_file_contexts_path=vend_rec.file_contexts_path,
         system_dir=s_dir,
@@ -2214,6 +2266,7 @@ def main() -> None:
         "miuicamera_device": src_cfg["miuicamera_device_commit"],
         "hyperos_port_tools": src_cfg["hyperos_port_tools_commit"],
         "cruecy_audio_effects": src_cfg["cruecy_audio_effects_commit"],
+        "spatializer_vendor": src_cfg["spatializer_vendor_commit"],
         "revanced_release": f"{src_cfg['revanced_repo']}@{src_cfg['revanced_release_tag']}",
     }
     asset_hashes = {
@@ -2231,6 +2284,8 @@ def main() -> None:
         "youtube_music_module_zip": sha256_file(revanced_zips["ytm"]),
         "otatools_zip": src_cfg["otatools_zip_sha256"],
         "cruecy_audio_effects_xml": src_cfg["cruecy_audio_effects_sha256"],
+        "spatializer_library": sha256_file(spatializer_library),
+        "spatializer_auxiliary_library": sha256_file(spatializer_auxiliary_library),
     }
     manifest = {
         "rom_name": rom_cfg["version_display"],

@@ -54,6 +54,12 @@
     "revanced_youtube_module_sha256": "a9d69c88533f5e8c0b1ae298ec855c92d36586b022c0c6423cd5f7c7d6ca7a3d",
     "revanced_ytmusic_module_sha256": "86b3890a3c026dcc4f666db06c0cb79063eb355c0221544d761439a751506d43",
     "cruecy_audio_effects_commit": "99ee109d595f52420c05213833c11faeaaa75339",
+    "spatializer_vendor_repo": "AndroidOne-Experience/vendor_xiaomi_miatoll",
+    "spatializer_vendor_commit": "9c1d3bca2addb04d8e42bbfbed65592801e6f5e7",
+    "spatializer_library_repo_path": "proprietary/vendor/lib/soundfx/libspatialaudio.so",
+    "spatializer_library_sha256": "d5c426488252d0ffa037a775db07a7fce9292418f1d03673a8aef75a45323a8f",
+    "spatializer_auxiliary_repo_path": "proprietary/vendor/lib/aoc_audio_stereo_spatializer.so",
+    "spatializer_auxiliary_sha256": "bdfde4cfa5621ee4853404e36f1442f4017855462452fee3d34f0d7189bee8ea",
     "otatools_zip_sha256": "ce2d6e3e1838b5932db21327ae529134f46ada89fefa310877861fc9df0c974d",
     "ksu_webui_apk_size_bytes": 1703779,
     "adaway_apk_size_bytes": 13955875

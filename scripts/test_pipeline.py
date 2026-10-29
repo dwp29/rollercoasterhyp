@@ -133,7 +133,10 @@ class TestRollercoasterPipeline(unittest.TestCase):
             "Workflow artifact and publisher paths must match the configured output ZIP name",
         )
         self.assertEqual(len(cfg["sources"]["cruecy_audio_effects_commit"]), 40)
+        self.assertEqual(len(cfg["sources"]["spatializer_vendor_commit"]), 40)
         self.assertEqual(len(cfg["sources"]["hyperos_port_tools_commit"]), 40)
+        self.assertEqual(len(cfg["sources"]["spatializer_library_sha256"]), 64)
+        self.assertEqual(len(cfg["sources"]["spatializer_auxiliary_sha256"]), 64)
         self.assertEqual(len(cfg["sources"]["otatools_zip_sha256"]), 64)
         self.assertGreater(cfg["sources"]["ksu_webui_apk_size_bytes"], 0)
         self.assertGreater(cfg["sources"]["adaway_apk_size_bytes"], 0)
@@ -564,20 +567,30 @@ class TestRollercoasterPipeline(unittest.TestCase):
             root = Path(td)
             magiskboot = root / "magiskboot"
             magiskboot.write_text(
-                "#!/usr/bin/env python3\n"
-                "import pathlib, struct, sys\n"
-                "args=sys.argv[1:]\n"
-                "def pack(data): return b'FAKEBOOT' + struct.pack('<I', len(data)) + data\n"
-                "def unpack(path):\n"
-                " p=pathlib.Path(path); data=p.read_bytes()\n"
-                " if data.startswith(b'FAKEBOOT') and len(data)>=12:\n"
-                "  n=struct.unpack('<I',data[8:12])[0]; kernel=data[12:12+n]\n"
-                " else: kernel=b'original-kernel'\n"
-                " pathlib.Path('kernel').write_bytes(kernel)\n"
-                " return\n"
-                "if args[0]=='unpack': unpack(args[-1])\n"
-                "elif args[0]=='repack': pathlib.Path(args[-1]).write_bytes(pack(pathlib.Path('kernel').read_bytes()))\n"
-                "else: raise SystemExit(2)\n",
+                r"""#!/usr/bin/env python3
+import pathlib, struct, sys
+args = sys.argv[1:]
+def pack(kernel, header):
+    encoded = header.encode()
+    return b"FAKEBOOT" + struct.pack("<II", len(encoded), len(kernel)) + encoded + kernel
+def unpack(path):
+    data = pathlib.Path(path).read_bytes()
+    if data.startswith(b"FAKEBOOT") and len(data) >= 16:
+        header_len, kernel_len = struct.unpack("<II", data[8:16])
+        header = data[16:16 + header_len].decode()
+        kernel = data[16 + header_len:16 + header_len + kernel_len]
+    else:
+        header = "cmdline=console=ttyMSM0 androidboot.selinux=permissive memmap=32M@0x0\nextra_cmdline=ram.mem_address=0x1000 enforcing=0\n"
+        kernel = b"original-kernel"
+    pathlib.Path("header").write_text(header)
+    pathlib.Path("kernel").write_bytes(kernel)
+if args[0] == "unpack":
+    unpack(args[-1])
+elif args[0] == "repack":
+    pathlib.Path(args[-1]).write_bytes(pack(pathlib.Path("kernel").read_bytes(), pathlib.Path("header").read_text()))
+else:
+    raise SystemExit(2)
+""",
                 encoding="utf-8",
             )
             magiskboot.chmod(0o755)
@@ -597,7 +610,16 @@ class TestRollercoasterPipeline(unittest.TestCase):
             self.assertTrue(patched_boot.is_file())
             self.assertTrue(out_ksud.is_file())
             self.assertTrue(out_ksud.stat().st_mode & 0o111)
-            self.assertIn(b"4.14.370-Rollercoaster-Roll.3.3", patched_boot.read_bytes())
+            patched_data = patched_boot.read_bytes()
+            self.assertIn(b"4.14.370-Rollercoaster-Roll.3.3", patched_data)
+            header_len, kernel_len = struct.unpack("<II", patched_data[8:16])
+            patched_header = patched_data[16 : 16 + header_len].decode()
+            self.assertIn("androidboot.selinux=enforcing", patched_header)
+            self.assertNotIn("androidboot.selinux=permissive", patched_header)
+            self.assertNotIn("memmap=", patched_header)
+            self.assertNotIn("ram.mem_address=", patched_header)
+            self.assertNotIn("enforcing=0", patched_header)
+            self.assertGreater(kernel_len, 0)
 
     def test_15_release_notes_and_safe_part_sizes(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -716,9 +738,14 @@ class TestRollercoasterPipeline(unittest.TestCase):
                 "/vendor/bin/hw(/.*)? u:object_r:vendor_file:s0\n",
                 encoding="utf-8",
             )
-            spatial_lib = vendor / "lib64" / "soundfx" / "libspatialaudio.so"
-            spatial_lib.parent.mkdir(parents=True)
-            spatial_lib.write_bytes(b"spatializer-fixture")
+            spatializer_library = root / "libspatialaudio.so"
+            spatializer_auxiliary_library = root / "aoc_audio_stereo_spatializer.so"
+            arm32_elf_header = bytearray(20)
+            arm32_elf_header[:6] = b"\x7fELF\x01\x01"
+            arm32_elf_header[16:18] = (3).to_bytes(2, "little")
+            arm32_elf_header[18:20] = (40).to_bytes(2, "little")
+            spatializer_library.write_bytes(arm32_elf_header + b"spatializer-fixture")
+            spatializer_auxiliary_library.write_bytes(arm32_elf_header + b"aux-spatializer-fixture")
 
             source_xml = root / "audio_effects.xml"
             source_xml.write_text(
@@ -749,10 +776,15 @@ class TestRollercoasterPipeline(unittest.TestCase):
                 system_ext_dir=system_ext,
                 custom_dax_apk=dax_apk,
                 cruecy_audio_effects_xml=source_xml,
+                spatializer_library=spatializer_library,
+                spatializer_auxiliary_library=spatializer_auxiliary_library,
                 runtime_policy_rule=REPO_ROOT / "modules" / "rollercoaster_core" / "sepolicy.rule",
                 partition_file_contexts_path=partition_file_contexts,
             )
-            self.assertEqual(result["vendor_blob_count"], 6)
+            self.assertEqual(result["vendor_blob_count"], 8)
+            self.assertEqual(result["dolby_source_blob_count"], 6)
+            self.assertTrue((vendor / "lib" / "soundfx" / "libspatialaudio.so").is_file())
+            self.assertTrue((vendor / "lib" / "aoc_audio_stereo_spatializer.so").is_file())
             policy_validation = result["selinux_policy_validation"]
             self.assertIn("hal_dms_hwservice", policy_validation["required_types"])
             self.assertEqual(set(policy_validation["base_missing_dolby_types"]), set(policy_validation["required_types"]))

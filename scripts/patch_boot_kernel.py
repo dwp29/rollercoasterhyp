@@ -6,8 +6,8 @@ Verified on miatoll 128 MB boot.img (134,217,728 bytes):
   2. Unpacks ROM boot.img with `magiskboot unpack -h`.
   3. Replaces `kernel` with decompressed `Image` from Rollercoaster-Roll.3.3's `Image.gz`.
   4. Preserves ROM's native `dtb` unless it matches 3.0.304.0 SHA-256 (exact Roll 3.3 rule).
-  5. Strips any stale `memmap=` / `ram.mem_address=` tokens from header cmdline.
-  6. Repacks & round-trip verifies `Linux version 4.14.370-Rollercoaster-Roll.3.3` inside boot.img.
+  5. Removes stale memory-map and SELinux-disable/permissive tokens; forces enforcing mode.
+  6. Repacks & round-trip verifies the kernel banner and enforcing boot cmdline.
   7. Extracts Roll 3.3's `ksud` binary for ROM seeding.
 """
 
@@ -16,7 +16,6 @@ from __future__ import annotations
 import argparse
 import gzip
 import hashlib
-import re
 import shutil
 import subprocess
 import zipfile
@@ -32,6 +31,19 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def sanitize_boot_cmdline(cmdline: str, force_enforcing: bool = True) -> str:
+    """Remove legacy disable/permissive boot arguments and optionally force enforcing mode."""
+    tokens = [
+        token
+        for token in cmdline.split()
+        if not token.startswith(("memmap=", "ram.mem_address=", "androidboot.selinux=", "selinux="))
+        and token != "enforcing=0"
+    ]
+    if force_enforcing:
+        tokens.append("androidboot.selinux=enforcing")
+    return " ".join(tokens)
 
 
 def patch_boot_image(
@@ -105,19 +117,25 @@ def patch_boot_image(
             print(f"[boot-patcher] Preserved ROM native DTB (sha256={cur_dtb_sha[:16]}...)")
 
     header_file = unpack_dir / "header"
-    if header_file.is_file():
-        hdr_text = header_file.read_text(encoding="utf-8", errors="ignore")
-        new_lines = []
-        for line in hdr_text.splitlines():
-            if line.startswith("cmdline="):
-                cmd_val = line[len("cmdline="):]
-                cmd_val = re.sub(r"\bmemmap=\S+", "", cmd_val)
-                cmd_val = re.sub(r"\bram\.mem_address=\S+", "", cmd_val)
-                cmd_val = re.sub(r"\s+", " ", cmd_val).strip()
-                new_lines.append(f"cmdline={cmd_val}")
-            else:
-                new_lines.append(line)
-        header_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    if not header_file.is_file():
+        raise RuntimeError("magiskboot did not expose the boot header needed to enforce SELinux mode")
+    hdr_text = header_file.read_text(encoding="utf-8", errors="ignore")
+    new_lines = []
+    cmdline_seen = False
+    for line in hdr_text.splitlines():
+        field = next((key for key in ("cmdline=", "extra_cmdline=") if line.startswith(key)), None)
+        if field is not None:
+            cmd_val = sanitize_boot_cmdline(
+                line[len(field) :],
+                force_enforcing=not cmdline_seen,
+            )
+            new_lines.append(f"{field}{cmd_val}")
+            cmdline_seen = True
+        else:
+            new_lines.append(line)
+    if not cmdline_seen:
+        raise RuntimeError("Boot header has no cmdline or extra_cmdline field to sanitize")
+    header_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
 
     subprocess.run(
         [str(magiskboot), "repack", "boot.img", "new-boot.img"],
@@ -137,10 +155,25 @@ def patch_boot_image(
         )
 
     shutil.copy2(repacked, verify_dir / "boot.img")
-    subprocess.run([str(magiskboot), "unpack", "boot.img"], cwd=str(verify_dir), check=True)
+    subprocess.run([str(magiskboot), "unpack", "-h", "boot.img"], cwd=str(verify_dir), check=True)
     verified_kernel = (verify_dir / "kernel").read_bytes()
     if b"4.14.370-Rollercoaster-Roll.3.3" not in verified_kernel:
         raise RuntimeError("Round-trip verification failed: Roll 3.3 banner missing in repacked boot.img")
+    verified_header_file = verify_dir / "header"
+    if not verified_header_file.is_file():
+        raise RuntimeError("Round-trip verification failed: repacked boot header is unavailable")
+    verified_header = verified_header_file.read_text(encoding="utf-8", errors="ignore")
+    verified_cmdline = " ".join(
+        line.split("=", 1)[1]
+        for line in verified_header.splitlines()
+        if line.startswith(("cmdline=", "extra_cmdline="))
+    ).split()
+    if (
+        verified_cmdline.count("androidboot.selinux=enforcing") != 1
+        or any(token.startswith("androidboot.selinux=") and token != "androidboot.selinux=enforcing" for token in verified_cmdline)
+        or any(token.startswith("selinux=") or token == "enforcing=0" for token in verified_cmdline)
+    ):
+        raise RuntimeError("Round-trip verification failed: boot cmdline is not explicitly SELinux enforcing")
 
     out_boot_img.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(repacked, out_boot_img)
