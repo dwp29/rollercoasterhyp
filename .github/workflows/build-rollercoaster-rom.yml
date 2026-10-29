@@ -1,0 +1,100 @@
+name: Build & Publish Rolleracoaster Hypos 4.0.1.7 (joyeuse)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "GitHub Release tag"
+        required: false
+        default: "v4.0.1.7-joyeuse"
+  push:
+    branches:
+      - main
+      - "arena/**"
+    paths:
+      - "scripts/**"
+      - "config/**"
+      - "modules/**"
+      - ".github/workflows/build-rollercoaster-rom.yml"
+
+concurrency:
+  group: rollercoaster-rom-build
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish:
+    name: Build Rolleracoaster Hypos 4.0.1.7 (Redmi Note 9 Pro / joyeuse)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+
+    steps:
+      - name: Safe Disk Space Preparation (Preserve System Services)
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost
+          df -h
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21 for Android SDK & Dolby UI Compilation
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install Android ROM Partitioning & Compression Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            aria2 brotli zstd p7zip-full unzip zip curl jq git \
+            erofs-utils android-sdk-libsparse-utils e2fsprogs \
+            python3-pil python3-pip fonts-dejavu-core gradle
+          echo "ANDROID_HOME=${ANDROID_HOME:-/usr/local/lib/android/sdk}" >> "$GITHUB_ENV"
+
+      - name: Run Pre-Flight Verification Suite
+        run: |
+          python3 scripts/test_pipeline.py
+
+      - name: Execute Full ROM Build (Rolleracoaster Hypos 4.0.1.7)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 scripts/build_rom.py \
+            --config config/rollercoaster_joyeuse.json \
+            --work-dir /mnt/rom_work \
+            --out-dir out \
+            --sdk-root "${ANDROID_HOME}" || \
+          python3 scripts/build_rom.py \
+            --config config/rollercoaster_joyeuse.json \
+            --work-dir "$RUNNER_TEMP/rom_work" \
+            --out-dir out \
+            --sdk-root "${ANDROID_HOME}"
+
+      - name: Upload Single Full ZIP to GoFile & Split <2GB Parts to GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ inputs.release_tag || 'v4.0.1.7-joyeuse' }}"
+          python3 scripts/upload_release.py \
+            --rom-zip out/Rolleracoaster-Hypos-4.0.1.7-joyeuse-Roll3.3-Official.zip \
+            --manifest out/build_manifest.json \
+            --tag "$TAG" \
+            --repo "${{ github.repository }}" \
+            --out-json out/release_summary.json \
+            --delete-source-after-gofile
+          cat out/release_summary.json
+
+      - name: Upload Release Summary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollercoaster-hypos-4.0.1.7-release-summary
+          path: |
+            out/release_summary.json
+            out/build_manifest.json
+            out/gh_release_assets/SHA256SUMS.txt
+            out/gh_release_assets/RELEASE_NOTES.md

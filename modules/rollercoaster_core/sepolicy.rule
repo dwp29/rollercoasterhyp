@@ -1,0 +1,10 @@
+# Allow Dolby Atmos DMS HAL & AudioServer interaction
+allow hal_audio_default vendor_dolby_dms_hwservice hwservice_manager find
+allow audioserver vendor_dolby_dms_hwservice hwservice_manager find
+allow system_app vendor_dolby_dms_hwservice hwservice_manager find
+allow priv_app vendor_dolby_dms_hwservice hwservice_manager find
+# Allow Face Unlock & Biometric camera access on joyeuse
+allow priv_app hal_camera_hwservice hwservice_manager find
+allow system_app hal_face_hwservice hwservice_manager find
+# Allow NFC NXP service access on joyeuse
+allow nfc vendor_nfc_prop file { read open getattr map }
