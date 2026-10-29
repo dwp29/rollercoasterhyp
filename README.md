@@ -9,7 +9,7 @@ Proyek ini menyiapkan ROM untuk **Xiaomi Redmi Note 9 Pro (`joyeuse`, keluarga `
 ## Integrasi yang disiapkan
 
 - Mengganti kernel di `boot.img` menggunakan `magiskboot`, memeriksa checksum kernel, batas ukuran partisi boot 128 MiB, dan hasil round-trip. Metadata `vbmeta` yang ditemukan dipatch untuk menonaktifkan verifikasi/hash-tree.
-- Mengemas ulang partisi EROFS dengan LZ4HC (`mkfs.erofs -zlz4hc,9`) agar sesuai dengan kernel yang dipilih. Metadata `super.img` divalidasi langsung mengikuti format AOSP liblp v10—termasuk checksum SHA-256 geometri, header, tabel, batas tabel, kapasitas perangkat, dan slot—untuk input raw/sparse serta hasil rebuild. Ini tidak mematikan pemeriksaan dan menghindari ketergantungan pada biner `lpdump` pihak ketiga. Ukuran `super.img` dan grup partisi dibatasi sesuai kapasitas joyeuse; pipeline menolak layout A/B.
+- Mengubah partisi dinamis `system`, `product`, `system_ext`, dan `vendor` menjadi EROFS terkompresi LZ4HC (`mkfs.erofs -zlz4hc,9`) untuk kernel yang dipin. Sebelum repack, pipeline memeriksa dukungan EROFS/LZ4 pada kernel, mengonversi fstab di pohon partisi serta ramdisk/DTB gambar boot yang ditemukan, dan memverifikasi round-trip; filesystem/fstab yang tidak cocok atau mount inti yang tidak tercakup ditolak. Metadata `super.img` divalidasi mengikuti AOSP liblp v10—termasuk checksum SHA-256, batas tabel, kapasitas perangkat, dan slot—dan batas grup dihitung dari geometri super sumber yang benar-benar dipakai. Guard kapasitas tetap keras; pipeline tidak membesarkan `super.img` dan menolak layout A/B/Virtual A/B.
 - Mengintegrasikan PropsHook ke `framework.jar` dengan hook pada `Instrumentation`, tanpa menerapkan patch signature-bypass dari proyek port sumber.
 - Menyiapkan modul KernelSU melalui `ksud`. Modul yang sudah ada dengan ID sama tidak ditimpa. Pengaktifan modul dan layanan root tetap perlu dicek pada perangkat.
 - Menambal properti dan file fitur khusus `joyeuse`, GPS Indonesia, serta daftar aplikasi CN. Perubahan flag fitur tidak membuktikan bahwa NFC, face unlock, VoLTE/VoWiFi, atau fungsi hardware lain bekerja.
@@ -18,7 +18,7 @@ Proyek ini menyiapkan ROM untuk **Xiaomi Redmi Note 9 Pro (`joyeuse`, keluarga `
 
 ## Verifikasi dan build
 
-Push perubahan hanya menjalankan pemeriksaan sintaks dan rangkaian tes offline. Build ROM lengkap dijalankan secara manual melalui GitHub Actions (`workflow_dispatch`). Publikasi tidak berjalan otomatis: aktifkan `publish_release` hanya setelah build dan pemeriksaan hasil dinilai aman.
+Push perubahan hanya menjalankan pemeriksaan sintaks dan rangkaian tes offline. Sebelum build penuh, jalankan inspeksi sumber melalui GitHub Actions (`workflow_dispatch`) dengan `run_full_build=false` dan `publish_release=false`; artifact `source-fstab-inspection` memuat fstab ramdisk/DTB ROM sumber tanpa repack atau publikasi. Build ROM lengkap tetap manual, dan `publish_release` hanya boleh diaktifkan setelah build serta pemeriksaan hasil dinilai aman.
 
 Pre-flight dapat dijalankan dengan Python 3 dan Pillow:
 

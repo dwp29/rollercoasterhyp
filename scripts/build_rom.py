@@ -30,7 +30,13 @@ from build_support_and_overlays import (
 )
 from generate_bootanimation import generate_bootanimation
 from generate_ios_theme import generate_mtz
-from patch_boot_kernel import disable_vbmeta_verification, patch_boot_image, sha256_file
+from fstab_utils import patch_partition_fstabs_to_erofs
+from patch_boot_kernel import (
+    disable_vbmeta_verification,
+    patch_boot_environment_fstabs,
+    patch_boot_image,
+    sha256_file,
+)
 from rom_container import escape_fc_regex, repack_rom_workspace, run_cmd, unpack_rom_zip
 
 
@@ -2112,7 +2118,7 @@ def main() -> None:
 
     kernel_zip = repo_root / "prebuilt" / "kernel" / src_cfg["kernel_zip_name"]
     ksud_out = gen_dir / "ksud"
-    patch_boot_image(
+    boot_fstab_mounts = patch_boot_image(
         magiskboot=tools["magiskboot"],
         rom_boot_img=ws.boot_img_path,
         kernel_zip=kernel_zip,
@@ -2120,7 +2126,47 @@ def main() -> None:
         out_boot_img=ws.boot_img_path,
         out_ksud=ksud_out,
         work_dir=work_dir / "boot_patch",
+        convert_dynamic_fstabs=True,
+        slot_suffixed=bool(ws.super_geom and ws.super_geom.is_ab),
     )
+    additional_boot_fstab_mounts: Set[str] = set()
+    duplicate_boot_index = 0
+    other_boot_index = 0
+    for boot_env in sorted(ws.rom_extract_dir.rglob("*.img")):
+        if not boot_env.is_file() or boot_env.resolve() == ws.boot_img_path.resolve():
+            continue
+        if boot_env.name == "boot.img":
+            duplicate_boot_index += 1
+            duplicate_work = work_dir / "duplicate_boots" / f"{duplicate_boot_index:03d}"
+            additional_boot_fstab_mounts.update(
+                patch_boot_image(
+                    magiskboot=tools["magiskboot"],
+                    rom_boot_img=boot_env,
+                    kernel_zip=kernel_zip,
+                    expected_kernel_sha256=src_cfg["kernel_zip_sha256"],
+                    out_boot_img=boot_env,
+                    out_ksud=duplicate_work / "ksud",
+                    work_dir=duplicate_work,
+                    convert_dynamic_fstabs=True,
+                    slot_suffixed=bool(ws.super_geom and ws.super_geom.is_ab),
+                )
+            )
+        elif boot_env.name in {"vendor_boot.img", "init_boot.img", "recovery.img"}:
+            other_boot_index += 1
+            additional_boot_fstab_mounts.update(
+                patch_boot_environment_fstabs(
+                    tools["magiskboot"],
+                    boot_env,
+                    work_dir / "additional_boot_fstabs" / f"{other_boot_index:03d}",
+                    slot_suffixed=bool(ws.super_geom and ws.super_geom.is_ab),
+                )
+            )
+    if additional_boot_fstab_mounts:
+        boot_fstab_mounts.update(additional_boot_fstab_mounts)
+        print(
+            f"[boot-patcher] Additional boot environment fstab mounts verified: "
+            f"{sorted(additional_boot_fstab_mounts)}"
+        )
     patched_vbmeta = []
     for vbmeta_path in ws.vbmeta_paths:
         if not disable_vbmeta_verification(vbmeta_path):
@@ -2180,6 +2226,42 @@ def main() -> None:
                     },
                 )
 
+    erofs_fstab_files, partition_fstab_mounts, erofs_fstab_partitions = patch_partition_fstabs_to_erofs(
+        {
+            "system": s_dir,
+            "product": p_dir,
+            "system_ext": se_dir,
+            "vendor": v_dir,
+        },
+        slot_suffixed=bool(ws.super_geom and ws.super_geom.is_ab),
+    )
+    all_fstab_mounts = partition_fstab_mounts | boot_fstab_mounts
+    missing_fstab_mounts = sorted(set(required_partitions) - all_fstab_mounts)
+    if missing_fstab_mounts:
+        raise RuntimeError(
+            "Cannot safely switch dynamic partitions to EROFS: no matching fstab entry was found "
+            f"for {missing_fstab_mounts}; refusing to emit a filesystem/fstab mismatch"
+        )
+    missing_early_mounts = sorted({"system", "vendor"} - boot_fstab_mounts)
+    if missing_early_mounts:
+        raise RuntimeError(
+            "Cannot safely convert core boot filesystems: boot/DTB fstab coverage is missing "
+            f"{missing_early_mounts}; refusing to rely only on fstabs inside unmounted partitions"
+        )
+    for partition_name in required_partitions:
+        partition_record = ws.partitions[partition_name]
+        if partition_record.fs_type not in ("ext4", "erofs"):
+            raise RuntimeError(
+                f"Cannot convert {partition_name}: source filesystem is {partition_record.fs_type!r}, "
+                "expected ext4 or erofs"
+            )
+        partition_record.fs_type = "erofs"
+    print(
+        f"[fstab] EROFS coverage: {sorted(all_fstab_mounts)}; "
+        f"fstab files changed in partitions={erofs_fstab_files}, "
+        f"boot/DTB mount entries verified={sorted(boot_fstab_mounts)}; "
+        f"ext4 mounts converted in partition trees={sorted(erofs_fstab_partitions)}"
+    )
     fstab_count = patch_vendor_fstabs_strip_avb(v_dir)
     patch_gps_indonesia(v_dir)
     feature_file_count = patch_device_features_for_joyeuse(p_dir, s_dir)
@@ -2306,9 +2388,28 @@ def main() -> None:
             "performed": ws.super_geom is not None,
             "method": "AOSP liblp v10 parser; SHA-256 geometry/header/tables and bounds checks",
         },
+        "source_super_geometry": (
+            {
+                "device_bytes": (ws.super_geom.reported_dev_size or ws.super_geom.dev_size),
+                "group_limits_bytes": ws.super_geom.groups,
+                "slot_suffixed": ws.super_geom.is_ab,
+                "virtual_ab": ws.super_geom.virtual_ab,
+                "metadata_slots": ws.super_geom.metadata_slots,
+            }
+            if ws.super_geom is not None
+            else None
+        ),
         "repacked_partitions": sorted(ws.partitions.keys()),
         "patched_vbmeta": patched_vbmeta,
         "patched_vendor_fstab_count": fstab_count,
+        "dynamic_partition_filesystem": {
+            "type": "erofs",
+            "compression": "lz4hc,9",
+            "fstab_mounts_verified": sorted(all_fstab_mounts),
+            "partition_fstab_files_changed": erofs_fstab_files,
+            "partition_mounts_converted_from_ext4": sorted(erofs_fstab_partitions),
+            "boot_fstab_mounts_verified": sorted(boot_fstab_mounts),
+        },
         "patched_joyeuse_feature_file_count": feature_file_count,
         "removed_cn_packages": removed_cn_packages,
         "source_revisions": source_revisions,

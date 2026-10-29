@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       run_full_build:
-        description: "Build the complete ROM and save it as a workflow artifact"
+        description: "Build the complete ROM (false runs source fstab inspection only; no ROM build)"
         type: boolean
         required: true
         default: true
@@ -56,6 +56,39 @@ jobs:
         run: |
           python -m py_compile scripts/*.py
           python scripts/test_pipeline.py
+
+  inspect-source-fstabs:
+    name: Inspect source boot fstabs (diagnostic only)
+    if: github.event_name == 'workflow_dispatch' && inputs.run_full_build == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Compile the source inspector
+        run: python -m py_compile scripts/inspect_source_fstabs.py scripts/fstab_utils.py scripts/patch_boot_kernel.py
+
+      - name: Inspect pinned source ROM fstabs without repacking
+        run: |
+          python scripts/inspect_source_fstabs.py \
+            --config config/rollercoaster_joyeuse.json \
+            --work-dir "$RUNNER_TEMP/source_fstab_inspection" \
+            --out-report "$GITHUB_WORKSPACE/out/source_fstab_report.txt"
+
+      - name: Save source fstab diagnostic report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: source-fstab-inspection
+          path: out/source_fstab_report.txt
+          if-no-files-found: warn
+          retention-days: 7
 
   build:
     name: Build ROM image

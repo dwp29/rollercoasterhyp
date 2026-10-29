@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import os
@@ -40,7 +41,15 @@ from build_rom import (
 )
 from build_support_and_overlays import DOLBY_ID_TRANSLATIONS, write_indonesian_dolby_strings
 from generate_ios_theme import generate_mtz
-from patch_boot_kernel import disable_vbmeta_verification, patch_boot_image, sha256_file
+from fstab_utils import patch_dynamic_fstab_text, patch_partition_fstabs_to_erofs, strip_avb_verify_fstab_flags
+from patch_boot_kernel import (
+    disable_vbmeta_verification,
+    list_cpio_fstab_entries,
+    patch_boot_image,
+    patch_fdt_dynamic_fstabs,
+    sha256_file,
+    verify_kernel_erofs_lz4_support,
+)
 from rom_container import (
     EROFS_MAGIC,
     EXT4_MAGIC,
@@ -916,6 +925,24 @@ else:
                 {"qti_dynamic_partitions": device_budget + 1},
             )
 
+        actual_source_device_bytes = 8 * 1024**3
+        actual_source_budget = actual_source_device_bytes - 4 * 1024 * 1024
+        actual_source_geometry = SuperGeometry(
+            dev_size=actual_source_device_bytes,
+            reported_dev_size=actual_source_device_bytes,
+            groups={"qti_dynamic_partitions": actual_source_budget},
+        )
+        actual_caps = calculate_safe_group_caps(
+            actual_source_geometry,
+            {"qti_dynamic_partitions": actual_source_budget - 1024 * 1024},
+        )
+        self.assertEqual(actual_caps["qti_dynamic_partitions"], actual_source_budget)
+        with self.assertRaisesRegex(RuntimeError, "super-device budget"):
+            calculate_safe_group_caps(
+                actual_source_geometry,
+                {"qti_dynamic_partitions": actual_source_budget + 1},
+            )
+
         multi_group = SuperGeometry(
             dev_size=MAX_SUPER_DEVICE_SIZE_BYTES,
             groups={
@@ -1009,6 +1036,100 @@ else:
             self.assertLess(tight.stat().st_size, stage.stat().st_size)
             self.assertEqual(detect_fs_type(tight), "ext4")
             subprocess.run([str(e2fsck), "-f", "-n", str(tight)], check=True, capture_output=True, text=True)
+
+    def test_19_dynamic_fstab_erofs_conversion_and_kernel_support(self) -> None:
+        original = (
+            "# first-stage fstab\n"
+            "system /system ext4 ro,barrier=1,discard wait,logical,first_stage_mount,avb=vbmeta_system,slotselect\n"
+            "/dev/block/mapper/system_ext /system_ext ext4 ro,commit=10 wait,logical\n"
+            "/dev/block/mapper/product /product ext4 ro,nodelalloc wait,logical\n"
+            "/dev/block/mapper/vendor /vendor ext4 ro,data=ordered,discard wait,logical,verify\n"
+            "/dev/block/mapper/userdata /data ext4 rw,discard wait,check\n"
+        )
+        avb_stripped = strip_avb_verify_fstab_flags(original)
+        patched, found, changed = patch_dynamic_fstab_text(avb_stripped)
+        self.assertEqual(found, {"system", "system_ext", "product", "vendor"})
+        self.assertEqual(changed, found)
+        self.assertIn("system\t/system\terofs\tro\twait,logical,first_stage_mount", patched)
+        self.assertIn("/dev/block/mapper/system_ext\t/system_ext\terofs\tro\twait,logical", patched)
+        self.assertIn("/dev/block/mapper/product\t/product\terofs\tro\twait,logical", patched)
+        self.assertIn("/dev/block/mapper/vendor\t/vendor\terofs\tro\twait,logical", patched)
+        self.assertIn("/dev/block/mapper/userdata /data ext4 rw,discard wait,check", patched)
+        self.assertNotIn("avb=", patched)
+        self.assertNotIn("verify", patched)
+        self.assertNotIn("slotselect", patched)
+        slot_fstab, _slot_found, _slot_changed = patch_dynamic_fstab_text(
+            "system_a /system ext4 ro wait,logical,slotselect\n",
+            slot_suffixed=True,
+        )
+        self.assertIn("slotselect", slot_fstab)
+        again, found_again, changed_again = patch_dynamic_fstab_text(patched)
+        self.assertEqual(again, patched)
+        self.assertEqual(found_again, found)
+        self.assertFalse(changed_again)
+
+        with self.assertRaisesRegex(RuntimeError, "requests rw"):
+            patch_dynamic_fstab_text("system /system ext4 rw wait,logical\n")
+        with self.assertRaisesRegex(RuntimeError, "expected ext4 or erofs"):
+            patch_dynamic_fstab_text("system /system f2fs ro wait,logical\n")
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            roots = {}
+            for name in ("system", "product", "system_ext", "vendor"):
+                partition_root = root / name
+                partition_root.mkdir()
+                roots[name] = partition_root
+            fstab = roots["vendor"] / "etc" / "fstab.joyeuse"
+            fstab.parent.mkdir()
+            fstab.write_text(original, encoding="utf-8")
+            file_count, root_found, root_changed = patch_partition_fstabs_to_erofs(roots)
+            partition_patched, _partition_found, _partition_changed = patch_dynamic_fstab_text(original)
+            self.assertEqual(file_count, 1)
+            self.assertEqual(root_found, found)
+            self.assertEqual(root_changed, changed)
+            self.assertEqual(fstab.read_text(encoding="utf-8"), partition_patched)
+
+        cpio = bytearray()
+
+        def append_newc(name: str, mode: int, payload: bytes) -> None:
+            fields = [1, mode, 0, 0, 1, 0, len(payload), 0, 0, 0, 0, len(name.encode()) + 1, 0]
+            cpio.extend(b"070701" + b"".join(f"{field:08x}".encode("ascii") for field in fields))
+            cpio.extend(name.encode() + b"\0")
+            cpio.extend(b"\0" * ((-len(cpio)) % 4))
+            cpio.extend(payload)
+            cpio.extend(b"\0" * ((-len(cpio)) % 4))
+
+        append_newc("./first_stage_ramdisk/fstab.qcom", 0o100640, b"system /system ext4 ro wait,logical\n")
+        append_newc("TRAILER!!!", 0, b"")
+        with tempfile.TemporaryDirectory() as td:
+            cpio_path = Path(td) / "ramdisk.cpio"
+            cpio_path.write_bytes(cpio)
+            self.assertEqual(
+                list_cpio_fstab_entries(cpio_path),
+                [("./first_stage_ramdisk/fstab.qcom", 0o640)],
+            )
+
+        verify_kernel_erofs_lz4_support(b"erofs_fill_super z_erofs_lz4_decompress")
+        with self.assertRaisesRegex(RuntimeError, "does not expose the EROFS/LZ4 support"):
+            verify_kernel_erofs_lz4_support(b"ext4_fill_super")
+
+    def test_20_erofs_kernel_symbols_and_pinned_dtb_fstab(self) -> None:
+        cfg = json.loads((REPO_ROOT / "config" / "rollercoaster_joyeuse.json").read_text(encoding="utf-8"))
+        kernel_zip = REPO_ROOT / "prebuilt" / "kernel" / cfg["sources"]["kernel_zip_name"]
+        with zipfile.ZipFile(kernel_zip, "r") as zf:
+            kernel_image = gzip.decompress(zf.read("Image.gz"))
+            kernel_dtb = zf.read("dtb")
+        verify_kernel_erofs_lz4_support(kernel_image)
+
+        patched_dtb, mounts, converted = patch_fdt_dynamic_fstabs(kernel_dtb)
+        self.assertEqual(mounts, {"vendor"})
+        self.assertEqual(converted, {"vendor"})
+        self.assertNotEqual(patched_dtb, kernel_dtb)
+        verified_dtb, verified_mounts, verified_converted = patch_fdt_dynamic_fstabs(patched_dtb)
+        self.assertEqual(verified_dtb, patched_dtb)
+        self.assertEqual(verified_mounts, mounts)
+        self.assertFalse(verified_converted)
 
 
 if __name__ == "__main__":
