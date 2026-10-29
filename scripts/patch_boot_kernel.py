@@ -67,6 +67,10 @@ def patch_boot_image(
     raw_image = gzip.decompress(image_gz.read_bytes())
     if b"Linux version 4.14.370-Rollercoaster-Roll.3.3" not in raw_image:
         raise RuntimeError("Unexpected kernel banner inside Image.gz")
+    if b"add_type: alloc type_datum failed." not in raw_image:
+        raise RuntimeError(
+            "Pinned kernel lacks KernelSU live SELinux type creation required by the Dolby DMS policy"
+        )
 
     magiskboot = magiskboot.resolve()
     magiskboot.chmod(0o755)
@@ -144,6 +148,9 @@ def patch_boot_image(
     ksud_src = ak_dir / "ksud"
     if not ksud_src.is_file() or ksud_src.stat().st_size == 0:
         raise RuntimeError("ksud binary is missing from the pinned Rollercoaster kernel ZIP")
+    ksud_bytes = ksud_src.read_bytes()
+    if b"Failed to parse policy statement:" not in ksud_bytes or b"apply sepolicy batch partially succeeded" not in ksud_bytes:
+        raise RuntimeError("Pinned ksud lacks the KernelSU sepolicy parser needed by the Dolby DMS policy")
     out_ksud.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(ksud_src, out_ksud)
     out_ksud.chmod(out_ksud.stat().st_mode | 0o111)

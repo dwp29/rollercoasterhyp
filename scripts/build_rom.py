@@ -31,7 +31,7 @@ from build_support_and_overlays import (
 from generate_bootanimation import generate_bootanimation
 from generate_ios_theme import generate_mtz
 from patch_boot_kernel import disable_vbmeta_verification, patch_boot_image, sha256_file
-from rom_container import repack_rom_workspace, run_cmd, unpack_rom_zip
+from rom_container import escape_fc_regex, repack_rom_workspace, run_cmd, unpack_rom_zip
 
 
 def safe_remove(target: Path) -> None:
@@ -907,15 +907,204 @@ def _merge_media_codec_include(vendor_dir: Path, include_name: str) -> Path:
     return config
 
 
-def validate_dolby_selinux_policy(vendor_dir: Path) -> Dict[str, Any]:
-    """Require the base vendor policy to support the pinned HIDL DMS service."""
+DOLBY_DMS_EXECUTABLE = "vendor.dolby.hardware.dms@2.0-service"
+DOLBY_DMS_RUNTIME_TYPES = (
+    "hal_dms_hwservice",
+    "hal_dms_default",
+    "hal_dms_default_exec",
+    "vendor_dolby_file",
+)
+DOLBY_DMS_RUNTIME_ATTRIBUTES = ("hal_dms", "hal_dms_client", "hal_dms_server")
+DOLBY_DMS_RUNTIME_SYMBOLS = tuple(dict.fromkeys(DOLBY_DMS_RUNTIME_TYPES + DOLBY_DMS_RUNTIME_ATTRIBUTES))
+DOLBY_DMS_BASE_POLICY_SYMBOLS = (
+    "domain",
+    "exec_type",
+    "vendor_file_type",
+    "file_type",
+    "data_file_type",
+    "hwservice_manager_type",
+    "halserverdomain",
+    "halclientdomain",
+    "init",
+    "vendor_data_file",
+    "hal_audio_default",
+    "platform_app",
+    "priv_app",
+    "system_server",
+    "mediacodec",
+    "hidl_base_hwservice",
+    "process",
+    "file",
+    "dir",
+    "hwservice_manager",
+    "binder",
+    "fd",
+    "getattr",
+    "open",
+    "read",
+    "execute",
+    "map",
+    "transition",
+    "siginh",
+    "rlimitinh",
+    "noatsecure",
+    "add",
+    "find",
+    "call",
+    "transfer",
+    "use",
+    "append",
+    "create",
+    "ioctl",
+    "lock",
+    "reparent",
+    "remove_name",
+    "rename",
+    "rmdir",
+    "search",
+    "setattr",
+    "watch",
+    "watch_reads",
+    "write",
+    "unlink",
+)
+
+
+def _upsert_selinux_context_entry(path: Path, entry: str) -> None:
+    """Add one SELinux context entry, replacing any previous entry with the same key."""
+    fields = entry.split()
+    if len(fields) < 2:
+        raise RuntimeError(f"Invalid SELinux context entry for {path}: {entry!r}")
+    key = fields[0]
+    current = path.read_text(encoding="utf-8", errors="ignore").splitlines() if path.is_file() else []
+    merged: List[str] = []
+    inserted = False
+    for line in current:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and stripped.split(None, 1)[0] == key:
+            if not inserted:
+                merged.append(entry)
+                inserted = True
+        else:
+            merged.append(line)
+    if not inserted:
+        merged.append(entry)
+    safe_write_text(path, "\n".join(merged).rstrip() + "\n")
+
+
+def merge_dolby_selinux_contexts(
+    dolby_repo: Path,
+    vendor_dir: Path,
+    partition_file_contexts_path: Path,
+) -> Dict[str, str]:
+    """Stage only the pinned HIDL DMS labels; the AIDL service remains excluded."""
+    source_selinux = dolby_repo / "sepolicy" / "vendor"
+    source_file_contexts = source_selinux / "file_contexts"
+    source_hwservice_contexts = source_selinux / "hwservice_contexts"
+    if not source_file_contexts.is_file() or not source_hwservice_contexts.is_file():
+        raise RuntimeError("Pinned AndroidOne Dolby SELinux file/hwservice contexts are missing")
+
+    source_file_lines = [
+        line.strip()
+        for line in source_file_contexts.read_text(encoding="utf-8", errors="ignore").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    service_entry = next(
+        (
+            line
+            for line in source_file_lines
+            if DOLBY_DMS_EXECUTABLE in line.replace("\\", "") and "hal_dms_default_exec" in line
+        ),
+        "",
+    )
+    data_entry = next(
+        (line for line in source_file_lines if "/data/vendor/dolby" in line and "vendor_dolby_file" in line),
+        "",
+    )
+    hwservice_lines = [
+        line.strip()
+        for line in source_hwservice_contexts.read_text(encoding="utf-8", errors="ignore").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    hwservice_entry = next(
+        (
+            line
+            for line in hwservice_lines
+            if "vendor.dolby.hardware.dms::IDms" in line and "hal_dms_hwservice" in line
+        ),
+        "",
+    )
+    if not service_entry or not data_entry or not hwservice_entry:
+        raise RuntimeError("Pinned AndroidOne Dolby SELinux contexts lack the HIDL DMS service/data labels")
+
+    selinux_dir = vendor_dir / "etc" / "selinux"
+    if not selinux_dir.is_dir():
+        raise RuntimeError("Base vendor partition has no etc/selinux policy directory for Dolby DMS")
+    vendor_file_contexts = selinux_dir / "vendor_file_contexts"
+    vendor_hwservice_contexts = selinux_dir / "vendor_hwservice_contexts"
+    _upsert_selinux_context_entry(vendor_file_contexts, service_entry)
+    _upsert_selinux_context_entry(vendor_file_contexts, data_entry)
+    _upsert_selinux_context_entry(vendor_hwservice_contexts, hwservice_entry)
+
+    service_context = service_entry.split()[-1]
+    partition_service_path = f"/vendor/bin/hw/{escape_fc_regex(DOLBY_DMS_EXECUTABLE)}"
+    _upsert_selinux_context_entry(
+        partition_file_contexts_path,
+        f"{partition_service_path} {service_context}",
+    )
+    return {
+        "service_file_context": service_entry,
+        "data_file_context": data_entry,
+        "hwservice_context": hwservice_entry,
+        "partition_service_path": partition_service_path,
+    }
+
+
+def _policy_has_symbol(policy_blob: bytes, name: str) -> bool:
+    encoded = re.escape(name.encode("ascii"))
+    return re.search(rb"(?<![A-Za-z0-9_-])" + encoded + rb"(?![A-Za-z0-9_-])", policy_blob) is not None
+
+
+def gate_dolby_dms_service_until_policy_ready(vendor_dir: Path) -> Path:
+    """Prevent init from launching the HIDL HAL until its runtime policy is installed."""
+    service_rc = vendor_dir / "etc" / "init" / f"{DOLBY_DMS_EXECUTABLE}.rc"
+    if not service_rc.is_file():
+        raise RuntimeError(f"Pinned Dolby HIDL service init file is missing: {service_rc}")
+    lines = service_rc.read_text(encoding="utf-8", errors="ignore").splitlines()
+    expected_service = f"service dms-hal-2-0 /vendor/bin/hw/{DOLBY_DMS_EXECUTABLE}"
+    service_index = next((i for i, line in enumerate(lines) if line.strip() == expected_service), None)
+    if service_index is None:
+        raise RuntimeError(f"Pinned Dolby HIDL init file has an unexpected service declaration: {service_rc}")
+    block_end = service_index + 1
+    while block_end < len(lines) and (not lines[block_end].strip() or lines[block_end][0].isspace()):
+        block_end += 1
+    if not any(line.strip() == "disabled" for line in lines[service_index + 1 : block_end]):
+        lines.insert(service_index + 1, "    disabled")
+    safe_write_text(service_rc, "\n".join(lines).rstrip() + "\n")
+    return service_rc
+
+
+def validate_dolby_selinux_policy(
+    vendor_dir: Path,
+    runtime_policy_rule: Path,
+    partition_file_contexts_path: Path,
+    system_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Verify a narrow KernelSU DMS policy and its labels, even when the base vendor lacks DMS types."""
     selinux_dir = vendor_dir / "etc" / "selinux"
     if not selinux_dir.is_dir():
         raise RuntimeError("Base vendor partition has no etc/selinux policy directory for Dolby DMS")
 
+    policy_roots = [("vendor", selinux_dir)]
+    if system_dir is not None and (system_dir / "etc" / "selinux").is_dir():
+        policy_roots.append(("system", system_dir / "etc" / "selinux"))
     policy_paths = sorted(
-        path
-        for path in selinux_dir.rglob("*")
+        (
+            root_name,
+            path,
+        )
+        for root_name, root in policy_roots
+        for path in root.rglob("*")
         if path.is_file()
         and not path.is_symlink()
         and (
@@ -924,21 +1113,125 @@ def validate_dolby_selinux_policy(vendor_dir: Path) -> Dict[str, Any]:
         )
     )
     if not policy_paths:
-        raise RuntimeError("Base vendor partition has no inspectable compiled or CIL SELinux policy for Dolby DMS")
-    policy_blob = b"\n".join(path.read_bytes() for path in policy_paths)
-    required_types = (
-        "hal_dms_hwservice",
-        "hal_dms_default",
-        "hal_dms_default_exec",
-        "hal_dms_client",
-        "hal_dms_server",
-        "vendor_dolby_file",
-    )
-    missing_types = [name for name in required_types if name.encode("ascii") not in policy_blob]
-    if missing_types:
+        raise RuntimeError("Base ROM has no inspectable compiled or CIL SELinux policy for Dolby DMS")
+    policy_blob = b"\n".join(path.read_bytes() for _, path in policy_paths)
+    missing_base_symbols = [
+        name for name in DOLBY_DMS_BASE_POLICY_SYMBOLS if not _policy_has_symbol(policy_blob, name)
+    ]
+    if missing_base_symbols:
         raise RuntimeError(
-            "Base vendor SELinux policy does not contain the pinned Dolby DMS domains/types "
-            f"{missing_types}; refusing to ship an unlabelled or nonfunctional HAL"
+            "Base Android SELinux policy lacks dependencies required by the narrow Dolby DMS policy "
+            f"{missing_base_symbols}; refusing to inject an unverified HAL policy"
+        )
+    base_runtime_collisions = [
+        name for name in DOLBY_DMS_RUNTIME_SYMBOLS if _policy_has_symbol(policy_blob, name)
+    ]
+    if base_runtime_collisions:
+        raise RuntimeError(
+            "Base Android SELinux policy already defines Dolby runtime type/attribute names "
+            f"{base_runtime_collisions}; refusing ambiguous KernelSU injection"
+        )
+
+    if not runtime_policy_rule.is_file() or runtime_policy_rule.stat().st_size == 0:
+        raise RuntimeError(f"KernelSU Dolby DMS runtime policy is missing or empty: {runtime_policy_rule}")
+    policy_statements = set()
+    for raw_line in runtime_policy_rule.read_text(encoding="utf-8", errors="ignore").splitlines():
+        for part in raw_line.split(";"):
+            statement = " ".join(part.strip().split())
+            if statement and not statement.startswith("#"):
+                policy_statements.add(statement)
+    if any(statement.startswith("permissive ") for statement in policy_statements):
+        raise RuntimeError("Dolby DMS runtime policy must not make any SELinux domain permissive")
+    oversized_groups = [
+        (statement, len(match.group(1)))
+        for statement in policy_statements
+        for match in re.finditer(r"\{([^}]*)\}", statement)
+        if len(match.group(1)) > 100
+    ]
+    if oversized_groups:
+        raise RuntimeError(
+            "KernelSU sepolicy parser accepts at most 100 characters inside each policy brace group: "
+            f"{oversized_groups}"
+        )
+
+    defined_attributes = {
+        match.group(1)
+        for statement in policy_statements
+        if (match := re.fullmatch(r"attribute\s+([A-Za-z0-9_-]+)", statement))
+    }
+    required_attributes = {"hal_dms", "hal_dms_client", "hal_dms_server"}
+    missing_attributes = sorted(required_attributes - defined_attributes)
+
+    defined_types: Dict[str, Set[str]] = {}
+    for statement in policy_statements:
+        match = re.fullmatch(r"type\s+([A-Za-z0-9_-]+)\s+(.+)", statement)
+        if match:
+            defined_types[match.group(1)] = set(re.findall(r"[A-Za-z0-9_-]+", match.group(2)))
+    required_type_attributes = {
+        "hal_dms_default": {"domain"},
+        "hal_dms_default_exec": {"exec_type", "vendor_file_type", "file_type"},
+        "hal_dms_hwservice": {"hwservice_manager_type"},
+        "vendor_dolby_file": {"file_type", "data_file_type"},
+    }
+    missing_type_definitions = {
+        name: sorted(attrs - defined_types.get(name, set()))
+        for name, attrs in required_type_attributes.items()
+        if not attrs.issubset(defined_types.get(name, set()))
+    }
+    required_typeattributes = {
+        ("hal_dms_default", "halserverdomain"),
+        ("hal_dms_default", "hal_dms_server"),
+        ("hal_dms_default", "hal_dms"),
+        ("hal_audio_default", "halclientdomain"),
+        ("hal_audio_default", "hal_dms_client"),
+        ("platform_app", "halclientdomain"),
+        ("platform_app", "hal_dms_client"),
+        ("priv_app", "halclientdomain"),
+        ("priv_app", "hal_dms_client"),
+        ("system_server", "halclientdomain"),
+        ("system_server", "hal_dms_client"),
+        ("mediacodec", "halclientdomain"),
+        ("mediacodec", "hal_dms_client"),
+    }
+    actual_typeattributes = {
+        tuple(match.groups())
+        for statement in policy_statements
+        if (match := re.fullmatch(r"typeattribute\s+([A-Za-z0-9_-]+)\s+([A-Za-z0-9_-]+)", statement))
+    }
+    missing_typeattributes = sorted(required_typeattributes - actual_typeattributes)
+
+    required_policy_statements = {
+        "type_transition init hal_dms_default_exec process hal_dms_default",
+        "allow init hal_dms_default_exec file { getattr open read execute map }",
+        "allow init hal_dms_default process transition",
+        "allow hal_dms_default hal_dms_default_exec file { entrypoint open read execute getattr map }",
+        "allow init hal_dms_default process { siginh rlimitinh }",
+        "dontaudit init hal_dms_default process noatsecure",
+        "allow hal_dms_server hal_dms_hwservice hwservice_manager { add find }",
+        "allow hal_dms_server hidl_base_hwservice hwservice_manager add",
+        "allow hal_dms_client hal_dms_hwservice hwservice_manager find",
+        "allow hal_dms_client hal_dms_server binder { call transfer }",
+        "allow hal_dms_server hal_dms_client binder transfer",
+        "allow hal_dms_client hal_dms_server fd use",
+        "allow hal_dms_server hal_dms_client binder { call transfer }",
+        "allow hal_dms_client hal_dms_server binder transfer",
+        "allow hal_dms_server hal_dms_client fd use",
+        "allow hal_dms_default hal_audio_default binder { call transfer }",
+        "allow hal_audio_default hal_dms_default binder transfer",
+        "allow hal_dms_default hal_audio_default fd use",
+        "allow hal_dms_default platform_app binder { call transfer }",
+        "allow platform_app hal_dms_default binder transfer",
+        "allow hal_dms_default platform_app fd use",
+        "allow hal_dms_default vendor_dolby_file dir { add_name create getattr ioctl lock open read }",
+        "allow hal_dms_default vendor_dolby_file dir { reparent remove_name rename rmdir search setattr watch watch_reads write }",
+        "allow hal_dms_default vendor_dolby_file file { append create getattr ioctl lock map open read rename setattr unlink watch watch_reads write }",
+    }
+    missing_policy_statements = sorted(required_policy_statements - policy_statements)
+    if missing_attributes or missing_type_definitions or missing_typeattributes or missing_policy_statements:
+        raise RuntimeError(
+            "KernelSU Dolby DMS policy is incomplete: "
+            f"attributes={missing_attributes}, types={missing_type_definitions}, "
+            f"typeattributes={missing_typeattributes}, rules={missing_policy_statements}"
         )
 
     hwservice_context_paths = sorted(
@@ -953,9 +1246,7 @@ def validate_dolby_selinux_policy(vendor_dir: Path) -> Dict[str, Any]:
         if line.strip() and not line.lstrip().startswith("#")
     )
     if not has_hwservice_context:
-        raise RuntimeError(
-            "Base vendor SELinux hwservice_contexts does not label vendor.dolby.hardware.dms::IDms"
-        )
+        raise RuntimeError("SELinux hwservice_contexts does not label vendor.dolby.hardware.dms::IDms")
 
     file_context_paths = sorted(
         path
@@ -969,8 +1260,7 @@ def validate_dolby_selinux_policy(vendor_dir: Path) -> Dict[str, Any]:
         if line.strip() and not line.lstrip().startswith("#")
     ]
     has_service_file_context = any(
-        "vendor.dolby.hardware.dms@2.0-service" in line.replace("\\", "")
-        and "hal_dms_default_exec" in line
+        DOLBY_DMS_EXECUTABLE in line.replace("\\", "") and "hal_dms_default_exec" in line
         for line in file_context_lines
     )
     has_dolby_data_context = any(
@@ -983,13 +1273,61 @@ def validate_dolby_selinux_policy(vendor_dir: Path) -> Dict[str, Any]:
             missing.append("HIDL DMS executable label")
         if not has_dolby_data_context:
             missing.append("/data/vendor/dolby data label")
-        raise RuntimeError(f"Base vendor SELinux file_contexts lacks required Dolby entries: {missing}")
+        raise RuntimeError(f"SELinux file_contexts lacks required Dolby entries: {missing}")
 
+    partition_context_lines = [
+        line
+        for line in partition_file_contexts_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ] if partition_file_contexts_path.is_file() else []
+    expected_partition_path = f"/vendor/bin/hw/{escape_fc_regex(DOLBY_DMS_EXECUTABLE)}"
+    if not any(
+        line.split()[0] == expected_partition_path and "hal_dms_default_exec" in line
+        for line in partition_context_lines
+    ):
+        raise RuntimeError("Vendor image file-context metadata does not label the DMS executable")
+
+    service_binary = vendor_dir / "bin" / "hw" / DOLBY_DMS_EXECUTABLE
+    service_rc = vendor_dir / "etc" / "init" / f"{DOLBY_DMS_EXECUTABLE}.rc"
+    if not service_binary.is_file() or not service_rc.is_file():
+        raise RuntimeError("Pinned Dolby HIDL DMS executable/init file is missing after blob staging")
+    service_rc_lines = service_rc.read_text(encoding="utf-8", errors="ignore").splitlines()
+    expected_service = f"service dms-hal-2-0 /vendor/bin/hw/{DOLBY_DMS_EXECUTABLE}"
+    service_index = next((i for i, line in enumerate(service_rc_lines) if line.strip() == expected_service), None)
+    if service_index is None:
+        raise RuntimeError("Dolby DMS init service declaration does not match the pinned HIDL executable")
+    block_end = service_index + 1
+    while block_end < len(service_rc_lines) and (
+        not service_rc_lines[block_end].strip() or service_rc_lines[block_end][0].isspace()
+    ):
+        block_end += 1
+    if not any(line.strip() == "disabled" for line in service_rc_lines[service_index + 1 : block_end]):
+        raise RuntimeError("Dolby HIDL service must stay disabled until KernelSU validates and applies its policy")
+
+    def relative_policy_path(root_name: str, path: Path) -> str:
+        root = dict(policy_roots)[root_name]
+        return f"{root_name}/{path.relative_to(root)}"
+
+    missing_base_dolby_types = [
+        name for name in DOLBY_DMS_RUNTIME_TYPES if not _policy_has_symbol(policy_blob, name)
+    ]
+    missing_base_dolby_attributes = [
+        name for name in DOLBY_DMS_RUNTIME_ATTRIBUTES if not _policy_has_symbol(policy_blob, name)
+    ]
     return {
-        "policy_files": [str(path.relative_to(vendor_dir)) for path in policy_paths],
-        "required_types": list(required_types),
+        "policy_files": [relative_policy_path(root_name, path) for root_name, path in policy_paths],
+        "runtime_policy_file": str(runtime_policy_rule),
+        "required_types": list(DOLBY_DMS_RUNTIME_TYPES),
+        "required_attributes": list(DOLBY_DMS_RUNTIME_ATTRIBUTES),
+        "base_missing_dolby_types": missing_base_dolby_types,
+        "base_missing_dolby_attributes": missing_base_dolby_attributes,
+        "base_missing_dolby_symbols": missing_base_dolby_types + missing_base_dolby_attributes,
+        "base_runtime_symbol_collisions": base_runtime_collisions,
+        "base_dependencies": list(DOLBY_DMS_BASE_POLICY_SYMBOLS),
+        "policy_delivery": "KernelSU sepolicy.rule applied synchronously on post-fs-data",
         "hwservice_context_files": [str(path.relative_to(vendor_dir)) for path in hwservice_context_paths],
         "file_context_files": [str(path.relative_to(vendor_dir)) for path in file_context_paths],
+        "partition_file_contexts": str(partition_file_contexts_path),
     }
 
 
@@ -999,9 +1337,11 @@ def integrate_cruecy_dolby_and_spatial(
     system_ext_dir: Path,
     custom_dax_apk: Path,
     cruecy_audio_effects_xml: Path,
+    runtime_policy_rule: Path,
+    partition_file_contexts_path: Path,
+    system_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
-    """Install Dolby blobs only when the base vendor policy can label and run the HIDL DMS HAL."""
-    selinux_policy_validation = validate_dolby_selinux_policy(vendor_dir)
+    """Install the pinned Dolby HAL with a narrowly scoped KernelSU SELinux policy."""
     blob_roots = [
         dolby_repo / "prebuilts" / "proprietary" / "vendor",
         dolby_repo / "proprietary" / "vendor",
@@ -1010,7 +1350,6 @@ def integrate_cruecy_dolby_and_spatial(
     blob_root = next((path for path in blob_roots if path.is_dir()), None)
     if blob_root is None:
         raise RuntimeError("AndroidOne vendor_dolby blobs not found (expected prebuilts/proprietary/vendor)")
-
     copied = 0
     excluded_aidl_files = {"bin/hw/vendor.dolby.dms.service", "etc/init/dms-service.rc"}
     for source in blob_root.rglob("*"):
@@ -1019,6 +1358,7 @@ def integrate_cruecy_dolby_and_spatial(
             safe_copy(source, vendor_dir / source.relative_to(blob_root))
             copied += 1
 
+    merge_dolby_selinux_contexts(dolby_repo, vendor_dir, partition_file_contexts_path)
     required_blob_relpaths = (
         "lib64/soundfx/libswdap.so",
         "lib64/soundfx/libdlbvol.so",
@@ -1028,6 +1368,15 @@ def integrate_cruecy_dolby_and_spatial(
     missing_blobs = [rel for rel in required_blob_relpaths if not (vendor_dir / rel).is_file()]
     if missing_blobs:
         raise RuntimeError(f"Dolby vendor blob integration is incomplete: {missing_blobs}")
+
+    gated_service_rc = gate_dolby_dms_service_until_policy_ready(vendor_dir)
+    selinux_policy_validation = validate_dolby_selinux_policy(
+        vendor_dir,
+        runtime_policy_rule,
+        partition_file_contexts_path,
+        system_dir=system_dir,
+    )
+    selinux_policy_validation["gated_service_init"] = str(gated_service_rc.relative_to(vendor_dir))
 
     required_effect_libraries = (
         "libswdap.so",
@@ -1287,6 +1636,10 @@ def seed_ksu_and_modules(
     mods_dir = seed_root / "modules"
     mods_dir.mkdir(parents=True, exist_ok=True)
     safe_copy(ksud_bin, seed_root / "ksud")
+    runtime_policy_rule = core_module_src / "sepolicy.rule"
+    if not runtime_policy_rule.is_file() or runtime_policy_rule.stat().st_size == 0:
+        raise RuntimeError("Rollercoaster core module is missing the Dolby DMS SELinux policy")
+    safe_copy(runtime_policy_rule, seed_root / "dolby_dms.sepolicy.rule")
 
     core_zip = mods_dir / "00_rollercoaster_core.zip"
     with zipfile.ZipFile(core_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -1325,6 +1678,44 @@ prepare_ksud() {
         ln -sf /data/adb/ksud "$KSUD" 2>/dev/null
         ln -sf /data/adb/ksud /data/adb/ksu/bin/resetprop 2>/dev/null
     fi
+    [ -x "$KSUD" ] || { echo "ksud unavailable during post-fs-data policy setup" >> "$LOG"; return 1; }
+}
+
+apply_dolby_sepolicy() {
+    POLICY_FILE="$SEED_DIR/dolby_dms.sepolicy.rule"
+    [ -s "$POLICY_FILE" ] || { echo "Dolby DMS runtime SELinux policy is missing" >> "$LOG"; return 1; }
+    "$KSUD" sepolicy check "$POLICY_FILE" >> "$LOG" 2>&1 || { echo "Dolby DMS SELinux policy syntax check failed" >> "$LOG"; return 1; }
+    APPLY_LOG="$STATE_DIR/dolby_dms_sepolicy_apply.log"
+    if ! "$KSUD" sepolicy apply "$POLICY_FILE" > "$APPLY_LOG" 2>&1; then
+        cat "$APPLY_LOG" >> "$LOG" 2>/dev/null
+        echo "Dolby DMS SELinux policy apply failed" >> "$LOG"
+        return 1
+    fi
+    cat "$APPLY_LOG" >> "$LOG" 2>/dev/null
+    if grep -Eq 'apply sepolicy batch (partially succeeded|failed)' "$APPLY_LOG"; then
+        echo "Dolby DMS SELinux policy was only partially applied; service remains disabled" >> "$LOG"
+        return 1
+    fi
+
+    mkdir -p /data/vendor/dolby 2>/dev/null
+    chown 1013:1013 /data/vendor/dolby 2>/dev/null
+    chmod 0770 /data/vendor/dolby 2>/dev/null
+    if command -v restorecon >/dev/null 2>&1; then
+        restorecon -RF /data/vendor/dolby >> "$LOG" 2>&1 || { echo "Dolby data restorecon failed" >> "$LOG"; return 1; }
+    else
+        echo "restorecon is unavailable; refusing to start the Dolby DMS HAL" >> "$LOG"
+        return 1
+    fi
+    if ! ls -Zd /data/vendor/dolby 2>/dev/null | grep -q 'u:object_r:vendor_dolby_file:s0'; then
+        echo "Dolby data directory did not receive vendor_dolby_file context" >> "$LOG"
+        return 1
+    fi
+    if ! ls -Zd "/vendor/bin/hw/vendor.dolby.hardware.dms@2.0-service" 2>/dev/null | grep -q 'u:object_r:hal_dms_default_exec:s0'; then
+        echo "Dolby DMS executable has no hal_dms_default_exec context; service remains disabled" >> "$LOG"
+        return 1
+    fi
+    setprop ctl.start dms-hal-2-0
+    echo "Dolby DMS SELinux policy applied; gated HIDL service start requested" >> "$LOG"
 }
 
 install_seed_modules() {
@@ -1363,7 +1754,8 @@ install_seed_modules() {
 
 case "$1" in
     --prepare)
-        prepare_ksud
+        prepare_ksud || exit 1
+        apply_dolby_sepolicy || exit 1
         ;;
     --install)
         install_seed_modules
@@ -1386,7 +1778,7 @@ esac
     safe_write_text(
         init_rc,
         """on post-fs-data
-    exec_background u:r:su:s0 root root -- /system/bin/sh /system/bin/rollercoaster_seed.sh --prepare
+    exec u:r:su:s0 root root -- /system/bin/sh /system/bin/rollercoaster_seed.sh --prepare
 
 on property:sys.boot_completed=1
     exec_background u:r:su:s0 root root -- /system/bin/sh /system/bin/rollercoaster_seed.sh --install
@@ -1778,6 +2170,9 @@ def main() -> None:
         system_ext_dir=se_dir,
         custom_dax_apk=dax_apk,
         cruecy_audio_effects_xml=audio_effects_source,
+        runtime_policy_rule=core_src / "sepolicy.rule",
+        partition_file_contexts_path=vend_rec.file_contexts_path,
+        system_dir=s_dir,
     )
     camera_manifest = integrate_leica_camera(
         cam_vendor_repo=cam_vendor,

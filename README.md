@@ -13,7 +13,7 @@ Proyek ini menyiapkan ROM untuk **Xiaomi Redmi Note 9 Pro (`joyeuse`, keluarga `
 - Mengintegrasikan PropsHook ke `framework.jar` dengan hook pada `Instrumentation`, tanpa menerapkan patch signature-bypass dari proyek port sumber.
 - Menyiapkan modul KernelSU melalui `ksud`. Modul yang sudah ada dengan ID sama tidak ditimpa. Pengaktifan modul dan layanan root tetap perlu dicek pada perangkat.
 - Menambal properti dan file fitur khusus `joyeuse`, GPS Indonesia, serta daftar aplikasi CN. Perubahan flag fitur tidak membuktikan bahwa NFC, face unlock, VoLTE/VoWiFi, atau fungsi hardware lain bekerja.
-- Menggabungkan audio effects/codec Dolby dan spatializer dari sumber yang dipin, membangun DAX UI Bahasa Indonesia, serta menyusun APK Leica Camera v6.8 dari potongan sumber. Integrasi file tidak menjamin HAL, izin, codec, kamera, atau efek audio berfungsi di perangkat.
+- Menggabungkan audio effects/codec Dolby dan spatializer dari sumber yang dipin, membangun DAX UI Bahasa Indonesia, serta menyusun APK Leica Camera v6.8 dari potongan sumber. Policy HIDL DMS yang sempit ditambahkan lewat KernelSU sebelum kelas HAL dimulai; layanan DMS tetap dinonaktifkan jika policy atau label runtime tidak tervalidasi. Tidak ada domain SELinux yang dibuat permissive. Integrasi file tidak menjamin HAL, izin, codec, kamera, atau efek audio berfungsi di perangkat.
 - Menyertakan Rollercoaster Support/overlay, tema MTZ, bootanimation, KernelSU Manager/WebUI, AdAway, HeliBoard, Insular, serta modul ReVanced yang diperiksa terhadap checksum dan payload MicroG.
 
 ## Verifikasi dan build

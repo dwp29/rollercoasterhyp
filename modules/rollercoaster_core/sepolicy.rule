@@ -1,5 +1,52 @@
-# Minimal DMS HIDL lookup permissions used by the pinned AndroidOne Dolby policy.
-# The target vendor policy must already define hal_dms_hwservice; no broad permissive rule is added.
-allow hal_audio_default hal_dms_hwservice hwservice_manager find
-allow priv_app hal_dms_hwservice hwservice_manager find
-allow platform_app hal_dms_hwservice hwservice_manager find
+# Narrow HIDL Dolby DMS policy for the pinned AndroidOne vendor blobs.
+# KernelSU applies these additions before the HAL class starts; no permissive domain is used.
+attribute hal_dms
+attribute hal_dms_client
+attribute hal_dms_server
+
+type hal_dms_default domain
+type hal_dms_default_exec { exec_type vendor_file_type file_type }
+type hal_dms_hwservice hwservice_manager_type
+type vendor_dolby_file { file_type data_file_type }
+
+typeattribute hal_dms_default halserverdomain
+typeattribute hal_dms_default hal_dms_server
+typeattribute hal_dms_default hal_dms
+typeattribute hal_audio_default halclientdomain
+typeattribute hal_audio_default hal_dms_client
+typeattribute platform_app halclientdomain
+typeattribute platform_app hal_dms_client
+typeattribute priv_app halclientdomain
+typeattribute priv_app hal_dms_client
+typeattribute system_server halclientdomain
+typeattribute system_server hal_dms_client
+typeattribute mediacodec halclientdomain
+typeattribute mediacodec hal_dms_client
+
+type_transition init hal_dms_default_exec process hal_dms_default
+allow init hal_dms_default_exec file { getattr open read execute map }
+allow init hal_dms_default process transition
+allow hal_dms_default hal_dms_default_exec file { entrypoint open read execute getattr map }
+allow init hal_dms_default process { siginh rlimitinh }
+dontaudit init hal_dms_default process noatsecure
+
+allow hal_dms_server hal_dms_hwservice hwservice_manager { add find }
+allow hal_dms_server hidl_base_hwservice hwservice_manager add
+allow hal_dms_client hal_dms_hwservice hwservice_manager find
+allow hal_dms_client hal_dms_server binder { call transfer }
+allow hal_dms_server hal_dms_client binder transfer
+allow hal_dms_client hal_dms_server fd use
+allow hal_dms_server hal_dms_client binder { call transfer }
+allow hal_dms_client hal_dms_server binder transfer
+allow hal_dms_server hal_dms_client fd use
+
+allow hal_dms_default hal_audio_default binder { call transfer }
+allow hal_audio_default hal_dms_default binder transfer
+allow hal_dms_default hal_audio_default fd use
+allow hal_dms_default platform_app binder { call transfer }
+allow platform_app hal_dms_default binder transfer
+allow hal_dms_default platform_app fd use
+
+allow hal_dms_default vendor_dolby_file dir { add_name create getattr ioctl lock open read }
+allow hal_dms_default vendor_dolby_file dir { reparent remove_name rename rmdir search setattr watch watch_reads write }
+allow hal_dms_default vendor_dolby_file file { append create getattr ioctl lock map open read rename setattr unlink watch watch_reads write }

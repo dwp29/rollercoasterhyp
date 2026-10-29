@@ -35,7 +35,6 @@ from build_rom import (
     safe_copy_android_path,
     safe_remove,
     seed_ksu_and_modules,
-    validate_dolby_selinux_policy,
     validate_module_zip,
     validate_props_hook_zip,
 )
@@ -519,13 +518,30 @@ class TestRollercoasterPipeline(unittest.TestCase):
             with zipfile.ZipFile(seed_root / "modules" / "00_rollercoaster_core.zip") as zf:
                 self.assertIn("module.prop", zf.namelist())
                 self.assertIn("service.sh", zf.namelist())
+                self.assertIn("sepolicy.rule", zf.namelist())
+            self.assertEqual(
+                (seed_root / "dolby_dms.sepolicy.rule").read_text(encoding="utf-8"),
+                (core / "sepolicy.rule").read_text(encoding="utf-8"),
+            )
             script_path = system / "bin" / "rollercoaster_seed.sh"
             script = script_path.read_text(encoding="utf-8")
             subprocess.run(["sh", "-n", str(script_path)], check=True)
             self.assertIn('module install "$module_zip"', script)
+            self.assertIn('"$KSUD" sepolicy check "$POLICY_FILE"', script)
+            self.assertIn('"$KSUD" sepolicy apply "$POLICY_FILE"', script)
+            self.assertIn("apply sepolicy batch (partially succeeded|failed)", script)
+            self.assertIn("setprop ctl.start dms-hal-2-0", script)
+            self.assertLess(
+                script.index('"$KSUD" sepolicy apply "$POLICY_FILE"'),
+                script.index("setprop ctl.start dms-hal-2-0"),
+            )
             self.assertIn("Preserving existing module", script)
             self.assertIn("--late)", script)
-            self.assertTrue((system / "etc" / "init" / "rollercoaster_seed.rc").is_file())
+            init_rc = system / "etc" / "init" / "rollercoaster_seed.rc"
+            self.assertTrue(init_rc.is_file())
+            init_rc_text = init_rc.read_text(encoding="utf-8")
+            self.assertIn("    exec u:r:su:s0", init_rc_text)
+            self.assertIn("rollercoaster_seed.sh --prepare", init_rc_text)
 
     def test_13_dolby_translation_coverage_fixture(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -640,10 +656,16 @@ class TestRollercoasterPipeline(unittest.TestCase):
                 "bin/hw/vendor.dolby.hardware.dms@2.0-service",
                 "bin/hw/vendor.dolby.dms.service",
                 "etc/init/dms-service.rc",
+                "etc/init/vendor.dolby.hardware.dms@2.0-service.rc",
             ):
                 file_path = blob_root / relative
                 file_path.parent.mkdir(parents=True, exist_ok=True)
                 file_path.write_bytes(b"dolby-fixture")
+            (blob_root / "etc/init/vendor.dolby.hardware.dms@2.0-service.rc").write_text(
+                "service dms-hal-2-0 /vendor/bin/hw/vendor.dolby.hardware.dms@2.0-service\n"
+                "    class hal\n    user media\n    group audio media\n",
+                encoding="utf-8",
+            )
             for relative, content in (
                 ("soundfx/dax-default.xml", "<dax/>\n"),
                 ("media/media_codecs_dolby_audio.xml", "<MediaCodecs/>\n"),
@@ -659,6 +681,19 @@ class TestRollercoasterPipeline(unittest.TestCase):
                 file_path.parent.mkdir(parents=True, exist_ok=True)
                 file_path.write_text(content, encoding="utf-8")
 
+            dolby_policy_dir = repo / "sepolicy" / "vendor"
+            dolby_policy_dir.mkdir(parents=True)
+            (dolby_policy_dir / "hwservice_contexts").write_text(
+                "vendor.dolby.hardware.dms::IDms u:object_r:hal_dms_hwservice:s0\n",
+                encoding="utf-8",
+            )
+            (dolby_policy_dir / "file_contexts").write_text(
+                "/data/vendor/dolby(/.*)? u:object_r:vendor_dolby_file:s0\n"
+                "/(vendor|system/vendor)/bin/hw/vendor\\.dolby\\.hardware\\.dms@2\\.0-service "
+                "u:object_r:hal_dms_default_exec:s0\n",
+                encoding="utf-8",
+            )
+
             vendor = root / "vendor"
             system_ext = root / "system_ext"
             vendor.mkdir()
@@ -666,25 +701,21 @@ class TestRollercoasterPipeline(unittest.TestCase):
             selinux_dir = vendor / "etc" / "selinux"
             selinux_dir.mkdir(parents=True)
             (selinux_dir / "precompiled_sepolicy").write_bytes(
-                b"hal_dms_hwservice hal_dms_default hal_dms_default_exec "
-                b"hal_dms_client hal_dms_server vendor_dolby_file"
+                b"domain exec_type vendor_file_type file_type data_file_type hwservice_manager_type "
+                b"halserverdomain halclientdomain init vendor_data_file hal_audio_default platform_app "
+                b"priv_app system_server mediacodec hidl_base_hwservice "
+                b"process file dir hwservice_manager binder fd "
+                b"getattr open read execute map transition siginh rlimitinh noatsecure "
+                b"add find call transfer use append create ioctl lock reparent remove_name rename "
+                b"rmdir search setattr watch watch_reads write unlink"
             )
-            (selinux_dir / "vendor_hwservice_contexts").write_text(
-                "vendor.dolby.hardware.dms::IDms u:object_r:hal_dms_hwservice:s0" + chr(10),
+            (selinux_dir / "vendor_hwservice_contexts").write_text("# base hwservices\n", encoding="utf-8")
+            (selinux_dir / "vendor_file_contexts").write_text("# base vendor files\n", encoding="utf-8")
+            partition_file_contexts = root / "vendor_image_file_contexts"
+            partition_file_contexts.write_text(
+                "/vendor/bin/hw(/.*)? u:object_r:vendor_file:s0\n",
                 encoding="utf-8",
             )
-            slash = chr(92)
-            service_context = (
-                "/(vendor|system/vendor)/bin/hw/vendor"
-                + slash + ".dolby" + slash + ".hardware" + slash + ".dms@2"
-                + slash + ".0-service u:object_r:hal_dms_default_exec:s0"
-            )
-            (selinux_dir / "vendor_file_contexts").write_text(
-                "/data/vendor/dolby(/.*)? u:object_r:vendor_dolby_file:s0"
-                + chr(10) + service_context + chr(10),
-                encoding="utf-8",
-            )
-            self.assertIn("hal_dms_hwservice", validate_dolby_selinux_policy(vendor)["required_types"])
             spatial_lib = vendor / "lib64" / "soundfx" / "libspatialaudio.so"
             spatial_lib.parent.mkdir(parents=True)
             spatial_lib.write_bytes(b"spatializer-fixture")
@@ -713,16 +744,40 @@ class TestRollercoasterPipeline(unittest.TestCase):
                 zf.writestr("classes.dex", b"dex-fixture")
 
             result = integrate_cruecy_dolby_and_spatial(
-                repo,
-                vendor,
-                system_ext,
-                dax_apk,
-                source_xml,
+                dolby_repo=repo,
+                vendor_dir=vendor,
+                system_ext_dir=system_ext,
+                custom_dax_apk=dax_apk,
+                cruecy_audio_effects_xml=source_xml,
+                runtime_policy_rule=REPO_ROOT / "modules" / "rollercoaster_core" / "sepolicy.rule",
+                partition_file_contexts_path=partition_file_contexts,
             )
-            self.assertEqual(result["vendor_blob_count"], 5)
-            self.assertIn("hal_dms_hwservice", result["selinux_policy_validation"]["required_types"])
+            self.assertEqual(result["vendor_blob_count"], 6)
+            policy_validation = result["selinux_policy_validation"]
+            self.assertIn("hal_dms_hwservice", policy_validation["required_types"])
+            self.assertEqual(set(policy_validation["base_missing_dolby_types"]), set(policy_validation["required_types"]))
+            self.assertEqual(
+                set(policy_validation["base_missing_dolby_attributes"]),
+                set(policy_validation["required_attributes"]),
+            )
+            self.assertEqual(
+                set(policy_validation["base_missing_dolby_symbols"]),
+                set(policy_validation["required_types"] + policy_validation["required_attributes"]),
+            )
+            self.assertEqual(policy_validation["base_runtime_symbol_collisions"], [])
+            self.assertEqual(
+                policy_validation["policy_delivery"],
+                "KernelSU sepolicy.rule applied synchronously on post-fs-data",
+            )
             self.assertFalse((vendor / "bin" / "hw" / "vendor.dolby.dms.service").exists())
             self.assertFalse((vendor / "etc" / "init" / "dms-service.rc").exists())
+            service_rc = vendor / "etc" / "init" / "vendor.dolby.hardware.dms@2.0-service.rc"
+            self.assertIn("    disabled", service_rc.read_text(encoding="utf-8"))
+            self.assertIn(
+                "/vendor/bin/hw/vendor\\.dolby\\.hardware\\.dms@2\\.0-service u:object_r:hal_dms_default_exec:s0",
+                partition_file_contexts.read_text(encoding="utf-8"),
+            )
+            self.assertIn("vendor_dolby_file", (selinux_dir / "vendor_file_contexts").read_text(encoding="utf-8"))
             self.assertTrue((system_ext / "priv-app" / "DolbyDaxUI" / "DolbyDaxUI.apk").is_file())
             codec_config = ET.parse(vendor / "etc" / "media_codecs_vendor.xml").getroot()
             self.assertTrue(any(item.get("href") == "media_codecs_dolby_audio.xml" for item in codec_config))
